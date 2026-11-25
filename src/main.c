@@ -1,6 +1,7 @@
 #include "benchmark.h"
 #include "common.h"
 #include "corpus.h"
+#include "history_cache.h"
 #include "index.h"
 #include "persistence.h"
 #include "report.h"
@@ -13,17 +14,20 @@
 static void print_banner(void) {
     printf("\n====================================================================\n");
     printf("   C Document Search & Information Retrieval Engine (CSIR v%s)\n", CSIR_VERSION);
-    printf("   Standard C11 | Positional Inverted Index | BM25 / TF-IDF / TF\n");
+    printf("   Standard C11 | Hash+DLL LRU Cache | Positional Index | BM25/TF-IDF\n");
     printf("====================================================================\n");
 }
 
-static void print_menu(const Corpus *corpus, const InvertedIndex *idx, const SearchConfig *cfg) {
-    printf("\n[Status] Corpus: %zu docs | Index: %zu terms (%s) | Scoring: %s | Top-K: %zu\n",
+static void print_menu(const Corpus *corpus, const InvertedIndex *idx,
+                       const SearchConfig *cfg, const QueryCache *qcache) {
+    printf("\n[Status] Corpus: %zu docs | Index: %zu terms (%s) | Scoring: %s | Top-K: %zu | Cache: %zu/%zu\n",
            corpus->count,
            idx->unique_terms,
            idx->unique_terms > 0 ? "READY" : "NOT BUILT",
            cfg->scoring == SCORE_BM25 ? "BM25" : (cfg->scoring == SCORE_TFIDF ? "TF-IDF" : "Basic TF"),
-           cfg->top_k);
+           cfg->top_k,
+           qcache->size,
+           qcache->capacity);
     printf("--------------------------------------------------------------------\n");
     printf("  1. Load Document Collection (folder path)\n");
     printf("  2. Build Inverted Index\n");
@@ -35,6 +39,7 @@ static void print_menu(const Corpus *corpus, const InvertedIndex *idx, const Sea
     printf("  8. Show Collection & Index Statistics (+ Top Terms Chart)\n");
     printf("  9. Run Performance Benchmark & IR Quality Evaluation\n");
     printf(" 10. Export Report (report.txt & report.csv)\n");
+    printf(" 11. Search History & LRU Cache (Doubly Linked List + Hash Table)\n");
     printf("  0. Exit\n");
     printf("--------------------------------------------------------------------\n");
     printf("Enter choice: ");
@@ -89,6 +94,276 @@ static void handle_settings(SearchConfig *cfg, bool *need_rebuild) {
         printf("Stopword removal is now %s. Rebuild the index (Option 2) to apply.\n",
                cfg->remove_stopwords ? "ENABLED" : "DISABLED");
     }
+}
+
+static void handle_history_menu(QueryCache *qcache, const Corpus *corpus,
+                                const SearchConfig *cfg, SearchResponse *last_search) {
+    char buf[128];
+    while (true) {
+        const CacheNode *cur = qcache_cursor_current(qcache);
+        printf("\n--- Search History & LRU Cache (Doubly Linked List + Hash Table) ---\n");
+        printf("Cursor: ");
+        if (cur) {
+            printf("Seq #%llu \"%s\" (%zu matches, %llu cache hits)\n",
+                   (unsigned long long)cur->seq_id, cur->query,
+                   cur->response.total_matches, (unsigned long long)cur->hit_count);
+        } else {
+            printf("(empty)\n");
+        }
+        printf("  1. Show History (Newest -> Oldest via ->next)\n");
+        printf("  2. Show History (Oldest -> Newest via ->prev)\n");
+        printf("  3. Step Older  (move cursor along ->next)\n");
+        printf("  4. Step Newer  (move cursor along ->prev)\n");
+        printf("  5. Display Cached Result at Cursor\n");
+        printf("  6. Remove History Entry by Seq ID (O(1) DLL unlink + Hash delete)\n");
+        printf("  7. Clear History & Cache\n");
+        printf("  0. Back to Main Menu\n");
+        printf("Select history action: ");
+        if (!csir_read_line(buf, sizeof(buf))) return;
+
+        int opt = -1;
+        if (!csir_parse_int(buf, &opt)) {
+            printf("Invalid input.\n");
+            continue;
+        }
+        switch (opt) {
+            case 1:
+                qcache_print_history(qcache, false);
+                break;
+            case 2:
+                qcache_print_history(qcache, true);
+                break;
+            case 3: {
+                const CacheNode *n = qcache_cursor_older(qcache);
+                if (n) {
+                    printf("Moved to older entry: Seq #%llu \"%s\" (%zu matches)\n",
+                           (unsigned long long)n->seq_id, n->query, n->response.total_matches);
+                } else {
+                    printf("History is empty.\n");
+                }
+                break;
+            }
+            case 4: {
+                const CacheNode *n = qcache_cursor_newer(qcache);
+                if (n) {
+                    printf("Moved to newer entry: Seq #%llu \"%s\" (%zu matches)\n",
+                           (unsigned long long)n->seq_id, n->query, n->response.total_matches);
+                } else {
+                    printf("History is empty.\n");
+                }
+                break;
+            }
+            case 5: {
+                const CacheNode *n = qcache_cursor_current(qcache);
+                if (!n) {
+                    printf("History is empty.\n");
+                } else {
+                    search_response_free(last_search);
+                    if (search_response_clone(&n->response, last_search)) {
+                        SearchConfig display_cfg = *cfg;
+                        display_cfg.scoring = n->scoring;
+                        display_cfg.top_k = n->top_k;
+                        report_print_search_results(corpus, last_search, &display_cfg);
+                    }
+                }
+                break;
+            }
+            case 6: {
+                printf("Enter Seq ID to remove: ");
+                if (!csir_read_line(buf, sizeof(buf))) break;
+                int sid = 0;
+                if (csir_parse_int(buf, &sid) && sid > 0 &&
+                    qcache_remove_by_seq(qcache, (uint64_t)sid)) {
+                    printf("Removed history entry Seq #%d.\n", sid);
+                } else {
+                    printf("Seq ID not found.\n");
+                }
+                break;
+            }
+            case 7:
+                qcache_clear(qcache);
+                printf("Search history and LRU cache cleared.\n");
+                break;
+            case 0:
+                return;
+            default:
+                printf("Unknown option %d.\n", opt);
+                break;
+        }
+    }
+}
+
+static int run_cli_batch_mode(const char *corpus_dir, const char *batch_file, size_t cache_cap) {
+    Corpus corpus;
+    InvertedIndex idx;
+    SearchConfig cfg;
+    QueryCache qcache;
+    corpus_init(&corpus);
+    index_init(&idx, 4096);
+    search_config_default(&cfg);
+    if (!qcache_init(&qcache, cache_cap > 0 ? cache_cap : 16, 64)) {
+        fprintf(stderr, "Error: Failed to initialize QueryCache\n");
+        return 1;
+    }
+
+    int loaded = corpus_load_dir(&corpus, corpus_dir);
+    if (loaded <= 0) {
+        fprintf(stderr, "Error: Failed to load corpus from '%s'\n", corpus_dir);
+        qcache_free(&qcache);
+        corpus_free(&corpus);
+        index_free(&idx);
+        return 1;
+    }
+    index_build(&idx, &corpus, cfg.remove_stopwords);
+
+    FILE *fp = fopen(batch_file, "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Cannot open batch input file '%s'\n", batch_file);
+        qcache_free(&qcache);
+        corpus_free(&corpus);
+        index_free(&idx);
+        return 1;
+    }
+
+    printf("====================================================================\n");
+    printf("  CSIR Complex Batch Stress & Verification Runner\n");
+    printf("  Corpus: %s (%zu docs, %zu unique terms) | Batch: %s\n",
+           corpus_dir, corpus.count, idx.unique_terms, batch_file);
+    printf("====================================================================\n");
+
+    char line[MAX_LINE_LEN];
+    size_t line_no = 0;
+    size_t queries_executed = 0;
+    size_t invariant_failures = 0;
+
+    while (fgets(line, sizeof(line), fp)) {
+        line_no++;
+        char *cmd = csir_trim(line);
+        if (cmd[0] == '\0' || cmd[0] == '#') continue;
+
+        if (strncmp(cmd, "@SCORING ", 9) == 0) {
+            const char *m = csir_trim(cmd + 9);
+            if (csir_strcasecmp(m, "tf") == 0) cfg.scoring = SCORE_BASIC_TF;
+            else if (csir_strcasecmp(m, "tfidf") == 0) cfg.scoring = SCORE_TFIDF;
+            else if (csir_strcasecmp(m, "bm25") == 0) cfg.scoring = SCORE_BM25;
+            printf("[Line %2zu] @SCORING -> %s\n", line_no, search_scoring_name(cfg.scoring));
+        } else if (strncmp(cmd, "@TOPK ", 6) == 0) {
+            int k = 10;
+            if (csir_parse_int(cmd + 6, &k) && k >= 0 && k <= 100) {
+                cfg.top_k = (size_t)k;
+                printf("[Line %2zu] @TOPK -> %zu\n", line_no, cfg.top_k);
+            }
+        } else if (strncmp(cmd, "@SNIPPETS ", 10) == 0) {
+            const char *v = csir_trim(cmd + 10);
+            cfg.show_snippets = (csir_strcasecmp(v, "on") == 0 || strcmp(v, "1") == 0);
+            printf("[Line %2zu] @SNIPPETS -> %s\n", line_no, cfg.show_snippets ? "ON" : "OFF");
+        } else if (strncmp(cmd, "@STOPWORDS ", 11) == 0) {
+            const char *v = csir_trim(cmd + 11);
+            bool sw = (csir_strcasecmp(v, "on") == 0 || strcmp(v, "1") == 0);
+            cfg.remove_stopwords = sw;
+            index_build(&idx, &corpus, sw);
+            qcache_clear(&qcache);
+            printf("[Line %2zu] @STOPWORDS -> %s (rebuilt index: %zu terms, cache cleared)\n",
+                   line_no, sw ? "ON" : "OFF", idx.unique_terms);
+        } else if (strncmp(cmd, "@CACHE_CAP ", 11) == 0) {
+            int c = 16;
+            if (csir_parse_int(cmd + 11, &c) && c >= 1 && c <= 256) {
+                qcache_free(&qcache);
+                qcache_init(&qcache, (size_t)c, (size_t)c * 2);
+                printf("[Line %2zu] @CACHE_CAP -> %d (cache reset)\n", line_no, c);
+            }
+        } else if (strcmp(cmd, "@CACHE_CLEAR") == 0) {
+            qcache_clear(&qcache);
+            printf("[Line %2zu] @CACHE_CLEAR -> cleared\n", line_no);
+        } else if (strcmp(cmd, "@HISTORY_FWD") == 0) {
+            qcache_print_history(&qcache, false);
+        } else if (strcmp(cmd, "@HISTORY_REV") == 0) {
+            qcache_print_history(&qcache, true);
+        } else if (strcmp(cmd, "@NAV_OLDER") == 0) {
+            const CacheNode *n = qcache_cursor_older(&qcache);
+            printf("[Line %2zu] @NAV_OLDER -> %s\n", line_no, n ? n->query : "(empty)");
+        } else if (strcmp(cmd, "@NAV_NEWER") == 0) {
+            const CacheNode *n = qcache_cursor_newer(&qcache);
+            printf("[Line %2zu] @NAV_NEWER -> %s\n", line_no, n ? n->query : "(empty)");
+        } else if (strncmp(cmd, "@REMOVE_SEQ ", 12) == 0) {
+            int sid = 0;
+            bool ok = csir_parse_int(cmd + 12, &sid) && sid > 0 &&
+                      qcache_remove_by_seq(&qcache, (uint64_t)sid);
+            printf("[Line %2zu] @REMOVE_SEQ %d -> %s\n", line_no, sid, ok ? "REMOVED" : "NOT FOUND");
+        } else if (strcmp(cmd, "@ASSERT_CACHE_INV") == 0) {
+            bool ok = qcache_verify_invariants(&qcache);
+            if (!ok) invariant_failures++;
+            printf("[Line %2zu] @ASSERT_CACHE_INV -> %s (size=%zu/%zu)\n",
+                   line_no, ok ? "PASS" : "FAIL", qcache.size, qcache.capacity);
+        } else if (strncmp(cmd, "@SAVE_LOAD_VERIFY ", 18) == 0) {
+            const char *idx_path = csir_trim(cmd + 18);
+            double save_s = 0.0, load_s = 0.0;
+            bool saved = persistence_save_index(idx_path, &corpus, &idx, &save_s);
+            Corpus rc;
+            InvertedIndex ri;
+            corpus_init(&rc);
+            index_init(&ri, 64);
+            bool loaded_ok = saved && persistence_load_index(idx_path, &rc, &ri, &load_s);
+            bool match = loaded_ok && rc.count == corpus.count &&
+                         ri.unique_terms == idx.unique_terms &&
+                         ri.total_postings == idx.total_postings;
+            if (!match) invariant_failures++;
+            printf("[Line %2zu] @SAVE_LOAD_VERIFY '%s' -> %s (save=%.2fms, load=%.2fms, docs=%zu, terms=%zu)\n",
+                   line_no, idx_path, match ? "PASS" : "FAIL",
+                   save_s * 1000.0, load_s * 1000.0, rc.count, ri.unique_terms);
+            corpus_free(&rc);
+            index_free(&ri);
+            remove(idx_path);
+        } else if (strncmp(cmd, "@QUERY ", 7) == 0) {
+            const char *q = csir_trim(cmd + 7);
+            SearchResponse resp;
+            bool hit = qcache_get(&qcache, q, &cfg, idx.stopwords_removed, &resp);
+            if (!hit) {
+                search_execute(&corpus, &idx, q, &cfg, &resp);
+                qcache_put(&qcache, q, &cfg, idx.stopwords_removed, &resp);
+            }
+            queries_executed++;
+            const char *top_file = "(none)";
+            double top_score = 0.0;
+            const char *top_matched = "";
+            if (resp.returned_count > 0) {
+                const Document *d = corpus_get_doc(&corpus, resp.results[0].doc_id);
+                if (d) top_file = d->filename;
+                top_score = resp.results[0].score;
+                top_matched = resp.results[0].matched_terms;
+            }
+            printf("[Q%02zu | %-4s] %-38.38s | matches=%2zu | top1=%-26.26s (%.3f) | %.4fms | [%s]\n",
+                   queries_executed, hit ? "HIT" : "MISS", q,
+                   resp.total_matches, top_file, top_score,
+                   resp.query_time_sec * 1000.0, top_matched);
+            search_response_free(&resp);
+            if (!qcache_verify_invariants(&qcache)) {
+                invariant_failures++;
+                fprintf(stderr, "  [ERROR] Cache invariant violation after query '%s'!\n", q);
+            }
+        } else {
+            printf("[Line %2zu] Ignored unrecognized directive: %s\n", line_no, cmd);
+        }
+    }
+
+    fclose(fp);
+
+    uint64_t total_req = qcache.total_hits + qcache.total_misses;
+    double hit_rate = total_req > 0 ? (100.0 * (double)qcache.total_hits / (double)total_req) : 0.0;
+    printf("====================================================================\n");
+    printf("Batch Complete: %zu queries | Hits: %llu | Misses: %llu | Hit Rate: %.1f%% | Evictions: %llu | Invariant Failures: %zu\n",
+           queries_executed,
+           (unsigned long long)qcache.total_hits,
+           (unsigned long long)qcache.total_misses,
+           hit_rate,
+           (unsigned long long)qcache.total_evictions,
+           invariant_failures);
+    printf("====================================================================\n");
+
+    qcache_free(&qcache);
+    corpus_free(&corpus);
+    index_free(&idx);
+    return invariant_failures == 0 ? 0 : 1;
 }
 
 static int run_cli_benchmark_mode(const char *corpus_dir, const char *eval_dir,
@@ -158,6 +433,8 @@ static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("  (no args)              Launch interactive menu-driven CLI\n");
     printf("  --dir <folder>         Auto-load & index a corpus folder on startup\n");
+    printf("  --cache-cap <N>        Set LRU query cache capacity (default: 16)\n");
+    printf("  --batch <file>         Run complex batch stress/verification script against --dir\n");
     printf("  --benchmark <folder>   Run full performance benchmark on <folder> and exit\n");
     printf("  --eval <dir> <q> <qr>  Also run IR quality eval (P@K, R@K, MRR, MAP, NDCG)\n");
     printf("  --query <text>         Run a single query against --dir and exit\n");
@@ -169,12 +446,14 @@ static void print_usage(const char *prog) {
 int main(int argc, char **argv) {
     const char *auto_dir = NULL;
     const char *bench_dir = NULL;
+    const char *batch_file = NULL;
     const char *eval_dir = NULL;
     const char *eval_queries = NULL;
     const char *eval_qrels = NULL;
     const char *single_query = NULL;
     const char *report_txt = NULL;
     const char *report_csv = NULL;
+    size_t cache_cap = 16;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -182,6 +461,13 @@ int main(int argc, char **argv) {
             return 0;
         } else if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) {
             auto_dir = argv[++i];
+        } else if (strcmp(argv[i], "--cache-cap") == 0 && i + 1 < argc) {
+            int c = 16;
+            if (csir_parse_int(argv[++i], &c) && c >= 1 && c <= 1024) {
+                cache_cap = (size_t)c;
+            }
+        } else if (strcmp(argv[i], "--batch") == 0 && i + 1 < argc) {
+            batch_file = argv[++i];
         } else if (strcmp(argv[i], "--benchmark") == 0 && i + 1 < argc) {
             bench_dir = argv[++i];
         } else if (strcmp(argv[i], "--eval") == 0 && i + 3 < argc) {
@@ -206,9 +492,18 @@ int main(int argc, char **argv) {
                                       report_txt, report_csv);
     }
 
+    if (batch_file) {
+        if (!auto_dir) {
+            fprintf(stderr, "Error: --batch requires --dir <corpus_folder>\n");
+            return 1;
+        }
+        return run_cli_batch_mode(auto_dir, batch_file, cache_cap);
+    }
+
     Corpus corpus;
     InvertedIndex idx;
     SearchConfig cfg;
+    QueryCache qcache;
     SearchResponse last_search;
     BenchmarkSummary last_bench;
     bool has_bench = false;
@@ -217,6 +512,7 @@ int main(int argc, char **argv) {
     corpus_init(&corpus);
     index_init(&idx, 4096);
     search_config_default(&cfg);
+    qcache_init(&qcache, cache_cap, cache_cap * 2);
     memset(&last_search, 0, sizeof(last_search));
     memset(&last_bench, 0, sizeof(last_bench));
 
@@ -232,6 +528,7 @@ int main(int argc, char **argv) {
     if (single_query) {
         if (idx.unique_terms == 0) {
             fprintf(stderr, "Error: --query requires --dir <corpus_folder>\n");
+            qcache_free(&qcache);
             corpus_free(&corpus);
             index_free(&idx);
             return 1;
@@ -239,6 +536,7 @@ int main(int argc, char **argv) {
         search_execute(&corpus, &idx, single_query, &cfg, &last_search);
         report_print_search_results(&corpus, &last_search, &cfg);
         search_response_free(&last_search);
+        qcache_free(&qcache);
         corpus_free(&corpus);
         index_free(&idx);
         return 0;
@@ -248,7 +546,7 @@ int main(int argc, char **argv) {
     char input[MAX_QUERY_LEN];
 
     while (true) {
-        print_menu(&corpus, &idx, &cfg);
+        print_menu(&corpus, &idx, &cfg, &qcache);
         if (!csir_read_line(input, sizeof(input))) {
             printf("\nEOF received. Exiting.\n");
             break;
@@ -256,7 +554,7 @@ int main(int argc, char **argv) {
 
         int choice = -1;
         if (!csir_parse_int(input, &choice)) {
-            printf("Invalid choice. Please enter a number between 0 and 10.\n");
+            printf("Invalid choice. Please enter a number between 0 and 11.\n");
             continue;
         }
 
@@ -275,6 +573,7 @@ int main(int argc, char **argv) {
                     index_free(&idx);
                     index_init(&idx, 4096);
                     search_response_free(&last_search);
+                    qcache_clear(&qcache);
                     printf("Loaded %d documents from '%s' (empty: %zu, skipped: %zu).\n",
                            loaded, dir, corpus.empty_files, corpus.skipped_files);
                     printf("Run Option 2 to build the inverted index.\n");
@@ -290,6 +589,7 @@ int main(int argc, char **argv) {
                        cfg.remove_stopwords ? "removed" : "kept");
                 if (index_build(&idx, &corpus, cfg.remove_stopwords)) {
                     need_rebuild = false;
+                    qcache_clear(&qcache);
                     printf("Index built in %.4f s: %zu unique terms, %zu postings, %llu raw words.\n",
                            idx.build_time_sec, idx.unique_terms, idx.total_postings,
                            (unsigned long long)corpus.total_raw_tokens);
@@ -325,6 +625,7 @@ int main(int argc, char **argv) {
                     cfg.remove_stopwords = idx.stopwords_removed;
                     need_rebuild = false;
                     search_response_free(&last_search);
+                    qcache_clear(&qcache);
                     printf("Loaded index from '%s' in %.3f ms (%zu docs, %zu unique terms).\n",
                            path, elapsed * 1000.0, corpus.count, idx.unique_terms);
                 } else {
@@ -349,7 +650,13 @@ int main(int argc, char **argv) {
                     break;
                 }
                 search_response_free(&last_search);
-                if (search_execute(&corpus, &idx, q, &cfg, &last_search)) {
+                if (qcache_get(&qcache, q, &cfg, idx.stopwords_removed, &last_search)) {
+                    printf("[LRU CACHE HIT] Served via O(1) Hash+DLL cache in %.4f ms.\n",
+                           last_search.query_time_sec * 1000.0);
+                    report_print_search_results(&corpus, &last_search, &cfg);
+                } else if (search_execute(&corpus, &idx, q, &cfg, &last_search)) {
+                    qcache_put(&qcache, q, &cfg, idx.stopwords_removed, &last_search);
+                    printf("[CACHE MISS] Executed indexed search and stored in LRU cache.\n");
                     report_print_search_results(&corpus, &last_search, &cfg);
                 } else {
                     printf("Error: Search execution failed.\n");
@@ -390,10 +697,9 @@ int main(int argc, char **argv) {
                     printf("Error: Build or load an index first.\n");
                     break;
                 }
-                printf("Running benchmark (Linear Scan vs Linked-List vs Hash-Table vs Sorted-Array)...\n");
+                printf("Running benchmark (Linear vs Linked-List vs Hash vs Sorted-Array vs LRU Cache)...\n");
                 if (benchmark_run_performance(&corpus, &idx, &cfg, 15, &last_bench)) {
                     has_bench = true;
-                    /* Also run IR quality eval if eval corpus exists */
                     Corpus eval_c;
                     InvertedIndex eval_i;
                     corpus_init(&eval_c);
@@ -435,19 +741,24 @@ int main(int argc, char **argv) {
                 }
                 break;
             }
+            case 11:
+                handle_history_menu(&qcache, &corpus, &cfg, &last_search);
+                break;
             case 0:
                 printf("Cleaning up allocated memory and exiting. Goodbye!\n");
                 search_response_free(&last_search);
+                qcache_free(&qcache);
                 index_free(&idx);
                 corpus_free(&corpus);
                 return 0;
             default:
-                printf("Unknown option %d. Please choose 0-10.\n", choice);
+                printf("Unknown option %d. Please choose 0-11.\n", choice);
                 break;
         }
     }
 
     search_response_free(&last_search);
+    qcache_free(&qcache);
     index_free(&idx);
     corpus_free(&corpus);
     return 0;

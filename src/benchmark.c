@@ -1,4 +1,5 @@
 #include "benchmark.h"
+#include "history_cache.h"
 #include "persistence.h"
 
 #include <math.h>
@@ -134,6 +135,47 @@ bool benchmark_run_performance(const Corpus *corpus, const InvertedIndex *hash_i
         out_summary->sorted_array.worst_latency_ms = worst_ms;
         out_summary->sorted_array.throughput_qps = total_ms > 0.0 ? ((double)total_q * 1000.0 / total_ms) : 0.0;
         out_summary->sorted_array.memory_bytes = sa_index_memory_usage(&sa);
+    }
+
+    /* Experiment E: Hash + Doubly Linked List LRU Cache Hit */
+    {
+        QueryCache qcache;
+        if (qcache_init(&qcache, 64, 128)) {
+            /* Warm up the cache with all benchmark queries */
+            for (size_t q = 0; q < BENCH_QUERY_COUNT; q++) {
+                SearchResponse resp;
+                if (search_execute(corpus, hash_idx, BENCH_QUERIES[q], &bench_cfg, &resp)) {
+                    qcache_put(&qcache, BENCH_QUERIES[q], &bench_cfg, hash_idx->stopwords_removed, &resp);
+                    search_response_free(&resp);
+                }
+            }
+
+            double total_ms = 0.0, worst_ms = 0.0;
+            size_t total_q = (size_t)iterations * BENCH_QUERY_COUNT;
+            for (int it = 0; it < iterations; it++) {
+                for (size_t q = 0; q < BENCH_QUERY_COUNT; q++) {
+                    SearchResponse resp;
+                    if (qcache_get(&qcache, BENCH_QUERIES[q], &bench_cfg,
+                                   hash_idx->stopwords_removed, &resp)) {
+                        double ms = resp.query_time_sec * 1000.0;
+                        total_ms += ms;
+                        if (ms > worst_ms) worst_ms = ms;
+                        search_response_free(&resp);
+                    }
+                }
+            }
+            out_summary->lru_cache_hit.method_name = "E: Hash+DLL LRU Cache (Hit)";
+            out_summary->lru_cache_hit.build_time_sec = hash_idx->build_time_sec;
+            out_summary->lru_cache_hit.queries_run = total_q;
+            out_summary->lru_cache_hit.total_time_ms = total_ms;
+            out_summary->lru_cache_hit.avg_latency_ms = total_ms / (double)total_q;
+            out_summary->lru_cache_hit.worst_latency_ms = worst_ms;
+            out_summary->lru_cache_hit.throughput_qps = total_ms > 0.0 ? ((double)total_q * 1000.0 / total_ms) : 0.0;
+            out_summary->lru_cache_hit.memory_bytes = index_memory_usage(hash_idx) +
+                                                      qcache.size * sizeof(CacheNode) +
+                                                      qcache.bucket_count * sizeof(CacheNode *);
+            qcache_free(&qcache);
+        }
     }
 
     /* Persistence benchmark (save + reload binary index) */
@@ -347,6 +389,9 @@ void benchmark_print_summary(const BenchmarkSummary *s) {
     print_method_row(&s->linked_list);
     print_method_row(&s->hash_table);
     print_method_row(&s->sorted_array);
+    if (s->lru_cache_hit.queries_run > 0) {
+        print_method_row(&s->lru_cache_hit);
+    }
     printf("-----------------------------------------------------------------------------------------------\n");
 
     if (s->hash_table.avg_latency_ms > 0.0) {
@@ -354,6 +399,11 @@ void benchmark_print_summary(const BenchmarkSummary *s) {
         double speedup_vs_ll = s->linked_list.avg_latency_ms / s->hash_table.avg_latency_ms;
         printf("Hash-Table Speedup: %.1fx faster than Linear Scan, %.1fx faster than Linked-List Index\n",
                speedup_vs_linear, speedup_vs_ll);
+        if (s->lru_cache_hit.avg_latency_ms > 0.0) {
+            printf("LRU Cache Speedup : %.1fx faster than uncached Hash-Table lookup (%.1fx vs Linear Scan)\n",
+                   s->hash_table.avg_latency_ms / s->lru_cache_hit.avg_latency_ms,
+                   s->linear_scan.avg_latency_ms / s->lru_cache_hit.avg_latency_ms);
+        }
     }
 
     if (s->binary_file_bytes > 0) {

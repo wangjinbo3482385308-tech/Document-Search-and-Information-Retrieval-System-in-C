@@ -33,6 +33,7 @@ typedef struct BenchmarkSummary {
     MethodBenchResult linked_list;
     MethodBenchResult hash_table;
     MethodBenchResult sorted_array;
+    MethodBenchResult lru_cache_hit;
     double            binary_save_ms;
     double            binary_load_ms;
     size_t            binary_file_bytes;

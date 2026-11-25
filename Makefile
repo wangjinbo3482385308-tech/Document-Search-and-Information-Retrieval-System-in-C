@@ -8,6 +8,7 @@ CORE_SRCS := src/common.c \
              src/index.c \
              src/persistence.c \
              src/search.c \
+             src/history_cache.c \
              src/benchmark.c \
              src/report.c
 
