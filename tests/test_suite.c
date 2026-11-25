@@ -1,6 +1,7 @@
 #include "benchmark.h"
 #include "common.h"
 #include "corpus.h"
+#include "history_cache.h"
 #include "index.h"
 #include "persistence.h"
 #include "report.h"
@@ -75,15 +76,150 @@ static void write_temp_file(const char *path, const char *content) {
     }
 }
 
+static void test_out_of_order_posting_insertion(void) {
+    printf("[Test 2] Out-of-Order Posting & Position Insertion Invariant...\n");
+    InvertedIndex idx;
+    index_init(&idx, 32);
+
+    /* Deliberately insert doc_ids and positions in scrambled order */
+    uint32_t scrambled_docs[] = { 9, 2, 7, 0, 5, 2, 9, 1, 5 };
+    uint32_t scrambled_pos[]  = { 10, 4, 3, 1, 8, 1, 2, 6, 3 };
+    size_t n = sizeof(scrambled_docs) / sizeof(scrambled_docs[0]);
+    for (size_t i = 0; i < n; i++) {
+        index_add_occurrence(&idx, "quantum", scrambled_docs[i], scrambled_pos[i]);
+    }
+    /* Also add a second term for phrase test where rarest term is the SECOND word */
+    index_add_occurrence(&idx, "fusion", 5, 9);
+    index_add_occurrence(&idx, "fusion", 2, 5);
+
+    const TermEntry *e = index_lookup(&idx, "quantum");
+    ASSERT_TRUE(e != NULL && e->doc_freq == 6, "6 distinct doc_ids indexed");
+
+    /* Verify strict ascending doc_id order across posting list & ascending positions */
+    uint32_t expected_ids[] = { 0, 1, 2, 5, 7, 9 };
+    size_t k = 0;
+    bool sorted_ok = true;
+    bool pos_sorted_ok = true;
+    const PostingNode *last = NULL;
+    for (const PostingNode *p = e->postings_head; p; p = p->next) {
+        if (k >= 6 || p->doc_id != expected_ids[k]) sorted_ok = false;
+        for (uint32_t j = 1; j < p->term_freq; j++) {
+            if (p->positions[j] < p->positions[j - 1]) pos_sorted_ok = false;
+        }
+        last = p;
+        k++;
+    }
+    ASSERT_TRUE(sorted_ok && k == 6, "posting list maintains strict ascending doc_id order");
+    ASSERT_TRUE(last == e->postings_tail && last->doc_id == 9, "postings_tail points to max doc_id");
+    ASSERT_TRUE(pos_sorted_ok, "out-of-order positions kept sorted ascending for binary search");
+
+    /* Verify phrase search ("quantum fusion") works on scrambled index with pivot = second word */
+    Corpus c;
+    corpus_init(&c);
+    for (uint32_t d = 0; d < 10; d++) {
+        char name[32];
+        snprintf(name, sizeof(name), "d%u.txt", d);
+        Document *doc = corpus_add_entry(&c, name, "", name, 100);
+        doc->total_tokens = 20;
+    }
+    c.avg_doc_len = 20.0;
+
+    SearchConfig cfg;
+    search_config_default(&cfg);
+    cfg.show_snippets = false;
+    SearchResponse resp;
+    search_execute(&c, &idx, "\"quantum fusion\"", &cfg, &resp);
+    ASSERT_TRUE(resp.total_matches == 2, "phrase match finds doc 2 (pos 4,5) and doc 5 (pos 8,9)");
+    ASSERT_TRUE(resp.returned_count == 2 &&
+                ((resp.results[0].doc_id == 2 && resp.results[1].doc_id == 5) ||
+                 (resp.results[0].doc_id == 5 && resp.results[1].doc_id == 2)),
+                "exact doc_ids matched after out-of-order insertion");
+    search_response_free(&resp);
+
+    corpus_free(&c);
+    index_free(&idx);
+}
+
+static void test_doubly_linked_lru_cache(void) {
+    printf("[Test 3] Doubly Linked List + Hash Table LRU Query Cache...\n");
+
+    /* Intentionally small capacity (3) and tiny bucket table (4) to stress hash collisions & evictions */
+    QueryCache cache;
+    ASSERT_TRUE(qcache_init(&cache, 3, 4), "qcache_init succeeds");
+    ASSERT_TRUE(qcache_verify_invariants(&cache), "empty cache invariants hold");
+
+    SearchConfig cfg;
+    search_config_default(&cfg);
+
+    SearchResponse r1 = {0}, r2 = {0}, r3 = {0}, r4 = {0}, out = {0};
+    r1.total_matches = 11; snprintf(r1.original_query, sizeof(r1.original_query), "solar");
+    r2.total_matches = 22; snprintf(r2.original_query, sizeof(r2.original_query), "wind");
+    r3.total_matches = 33; snprintf(r3.original_query, sizeof(r3.original_query), "geothermal");
+    r4.total_matches = 44; snprintf(r4.original_query, sizeof(r4.original_query), "hydro");
+
+    /* Insert 3 items -> order MRU..LRU: geothermal(3) -> wind(2) -> solar(1) */
+    ASSERT_TRUE(qcache_put(&cache, "solar", &cfg, true, &r1), "put solar");
+    ASSERT_TRUE(qcache_put(&cache, "wind", &cfg, true, &r2), "put wind");
+    ASSERT_TRUE(qcache_put(&cache, "geothermal", &cfg, true, &r3), "put geothermal");
+    ASSERT_TRUE(cache.size == 3 && qcache_verify_invariants(&cache), "size=3 & invariants valid");
+    ASSERT_TRUE(strcmp(cache.head->query, "geothermal") == 0 &&
+                strcmp(cache.tail->query, "solar") == 0,
+                "head is MRU 'geothermal', tail is LRU 'solar'");
+
+    /* Cache HIT on 'solar' promotes it to MRU head -> solar -> geothermal -> wind */
+    ASSERT_TRUE(qcache_get(&cache, "solar", &cfg, true, &out), "cache hit on 'solar'");
+    ASSERT_TRUE(out.total_matches == 11, "cloned response matches original");
+    search_response_free(&out);
+    ASSERT_TRUE(strcmp(cache.head->query, "solar") == 0 &&
+                strcmp(cache.tail->query, "wind") == 0,
+                "'solar' promoted to MRU head, 'wind' becomes LRU tail");
+    ASSERT_TRUE(qcache_verify_invariants(&cache), "invariants hold after MRU promotion");
+
+    /* Config isolation: same query 'solar' under Basic TF must MISS */
+    SearchConfig tf_cfg = cfg;
+    tf_cfg.scoring = SCORE_BASIC_TF;
+    ASSERT_TRUE(!qcache_get(&cache, "solar", &tf_cfg, true, &out),
+                "different scoring method does not falsely hit BM25 cache entry");
+
+    /* Insert 4th item 'hydro' -> evicts LRU tail 'wind'! Order: hydro -> solar -> geothermal */
+    ASSERT_TRUE(qcache_put(&cache, "hydro", &cfg, true, &r4), "put hydro triggers eviction");
+    ASSERT_TRUE(cache.size == 3 && cache.total_evictions == 1, "1 LRU eviction occurred");
+    ASSERT_TRUE(!qcache_get(&cache, "wind", &cfg, true, &out), "'wind' was evicted");
+    ASSERT_TRUE(strcmp(cache.head->query, "hydro") == 0 &&
+                strcmp(cache.tail->query, "geothermal") == 0,
+                "post-eviction DLL order: hydro -> solar -> geothermal");
+    ASSERT_TRUE(qcache_verify_invariants(&cache), "invariants hold after eviction");
+
+    /* Bidirectional cursor navigation: head('hydro') -> older('solar') -> older('geothermal') -> newer('solar') */
+    qcache_cursor_reset(&cache);
+    ASSERT_TRUE(strcmp(qcache_cursor_current(&cache)->query, "hydro") == 0, "cursor starts at head");
+    ASSERT_TRUE(strcmp(qcache_cursor_older(&cache)->query, "solar") == 0, "cursor steps older via ->next");
+    ASSERT_TRUE(strcmp(qcache_cursor_older(&cache)->query, "geothermal") == 0, "cursor steps to tail");
+    ASSERT_TRUE(strcmp(qcache_cursor_older(&cache)->query, "geothermal") == 0, "cursor clamps at tail");
+    ASSERT_TRUE(strcmp(qcache_cursor_newer(&cache)->query, "solar") == 0, "cursor steps newer via ->prev");
+
+    /* Remove middle node ('solar'), then head ('hydro'), then tail ('geothermal') */
+    uint64_t mid_seq = cache.head->next->seq_id;
+    uint64_t head_seq = cache.head->seq_id;
+    uint64_t tail_seq = cache.tail->seq_id;
+    ASSERT_TRUE(qcache_remove_by_seq(&cache, mid_seq) && cache.size == 2 &&
+                qcache_verify_invariants(&cache), "remove middle DLL node preserves links");
+    ASSERT_TRUE(qcache_remove_by_seq(&cache, head_seq) && cache.size == 1 &&
+                qcache_verify_invariants(&cache), "remove head DLL node preserves links");
+    ASSERT_TRUE(qcache_remove_by_seq(&cache, tail_seq) && cache.size == 0 &&
+                qcache_verify_invariants(&cache), "remove last DLL node leaves clean empty list");
+
+    qcache_free(&cache);
+}
+
 static void test_core_search_and_edge_cases(void) {
-    printf("[Test 2] Core Indexing, Ranking, Phrase, Boolean, Wildcard & Edge Cases...\n");
+    printf("[Test 4] Core Indexing, Ranking, Min-Heap Top-K, Phrase, Boolean, Wildcard & CSV...\n");
 
     Corpus corpus;
     InvertedIndex idx;
     corpus_init(&corpus);
     index_init(&idx, 64);
 
-    /* Create temporary test documents matching the coursework PDF example */
     write_temp_file("_t_doc01.txt",
         "Renewable energy can reduce dependence on fossil fuels. Solar power is widely used.");
     write_temp_file("_t_doc02.txt",
@@ -106,7 +242,7 @@ static void test_core_search_and_edge_cases(void) {
     cfg.scoring = SCORE_BASIC_TF;
     cfg.show_snippets = true;
 
-    /* 2a. Multi-term query: doc02 has 'renewable'(1) + 'energy'(3) = 4; doc01 has 1 + 1 = 2 */
+    /* Multi-term query: doc02 has 'renewable'(1) + 'energy'(3) = 4; doc01 has 1 + 1 = 2 */
     SearchResponse resp;
     search_execute(&corpus, &idx, "renewable energy", &cfg, &resp);
     ASSERT_TRUE(resp.total_matches == 2, "renewable energy matches 2 docs");
@@ -119,30 +255,51 @@ static void test_core_search_and_edge_cases(void) {
                 "snippet highlights matched term");
     search_response_free(&resp);
 
-    /* 2b. Punctuation & repeated term normalization */
+    /* Min-heap Top-K (top_k = 1 < total_matches = 2) returns exact #1 winner */
+    cfg.top_k = 1;
+    search_execute(&corpus, &idx, "renewable energy", &cfg, &resp);
+    ASSERT_TRUE(resp.total_matches == 2 && resp.returned_count == 1 &&
+                resp.results[0].doc_id == 1, "Min-Heap Top-1 matches exact full-sort winner");
+    search_response_free(&resp);
+    cfg.top_k = 10;
+
+    /* Punctuation & repeated term normalization */
     search_execute(&corpus, &idx, "RENEWABLE-energy!! energy", &cfg, &resp);
     ASSERT_TRUE(resp.total_matches == 2 && fabs(resp.results[0].score - 4.0) < 1e-9,
                 "punctuation and repeated terms deduplicated identically");
     search_response_free(&resp);
 
-    /* 2c. No match query */
+    /* No match query */
     search_execute(&corpus, &idx, "quantumbanana", &cfg, &resp);
     ASSERT_TRUE(resp.total_matches == 0 && resp.returned_count == 0,
                 "unknown term returns 0 results");
     search_response_free(&resp);
 
-    /* 2d. Empty / whitespace / punctuation-only queries */
+    /* Empty / whitespace / punctuation-only queries */
     search_execute(&corpus, &idx, "   --- !!!   ", &cfg, &resp);
     ASSERT_TRUE(resp.total_matches == 0, "punctuation-only query handled safely");
     search_response_free(&resp);
 
-    /* 2e. Exact phrase query: "solar energy" appears ONLY in doc02, not doc01 ("Solar power") */
+    /* Exact phrase query + CSV RFC4180 quote escaping verification */
     search_execute(&corpus, &idx, "\"solar energy\"", &cfg, &resp);
     ASSERT_TRUE(resp.used_phrase && resp.total_matches == 1 && resp.results[0].doc_id == 1,
                 "exact phrase \"solar energy\" matches only doc02");
+    ASSERT_TRUE(report_export_csv("_t_csv.csv", &corpus, &resp, NULL), "CSV export succeeds");
+    {
+        FILE *cf = fopen("_t_csv.csv", "r");
+        char buf[512] = {0};
+        if (cf) {
+            size_t nr = fread(buf, 1, sizeof(buf) - 1, cf);
+            buf[nr] = '\0';
+            fclose(cf);
+        }
+        ASSERT_TRUE(strstr(buf, "\"\"solar energy\"\"") != NULL,
+                    "CSV properly escapes embedded double quotes per RFC 4180");
+        remove("_t_csv.csv");
+    }
     search_response_free(&resp);
 
-    /* 2f. Boolean AND / NOT queries */
+    /* Boolean AND / NOT queries */
     search_execute(&corpus, &idx, "solar AND wind", &cfg, &resp);
     ASSERT_TRUE(resp.used_boolean && resp.total_matches == 1 && resp.results[0].doc_id == 1,
                 "Boolean AND narrows to doc02");
@@ -153,19 +310,23 @@ static void test_core_search_and_edge_cases(void) {
                 "Boolean NOT excludes doc01");
     search_response_free(&resp);
 
-    /* 2g. Wildcard prefix query: comput* matches "computation" (doc02) and "computers" (doc03) */
+    /* Wildcard prefix query: comput* matches "computation" (doc02) and "computers" (doc03) */
     search_execute(&corpus, &idx, "comput*", &cfg, &resp);
     ASSERT_TRUE(resp.used_wildcard && resp.total_matches == 2,
                 "Wildcard comput* matches doc02 and doc03");
+    ASSERT_TRUE(strstr(resp.results[0].matched_terms, "comput") != NULL,
+                "Wildcard populates matched_terms on Top-K results");
     search_response_free(&resp);
 
-    /* 2h. Deterministic tie-breaking: doc01 & doc03 both contain 'reduce' once -> doc01 (ID 0) first */
+    /* Deterministic tie-breaking: doc01 & doc03 both contain 'reduce' once -> doc01 (ID 0) first */
+    cfg.top_k = 1;
     search_execute(&corpus, &idx, "reduce", &cfg, &resp);
-    ASSERT_TRUE(resp.total_matches == 2 && resp.results[0].doc_id == 0 && resp.results[1].doc_id == 2,
-                "tie-breaking orders by doc_id ascending");
+    ASSERT_TRUE(resp.total_matches == 2 && resp.returned_count == 1 && resp.results[0].doc_id == 0,
+                "Min-Heap tie-breaking selects lower doc_id (0 over 2)");
     search_response_free(&resp);
+    cfg.top_k = 10;
 
-    /* 2i. Binary Persistence Save + Reload equivalence */
+    /* Binary Persistence Save + Reload equivalence */
     double save_s = 0.0, load_s = 0.0;
     ASSERT_TRUE(persistence_save_index("_t_test.idx", &corpus, &idx, &save_s),
                 "binary index save succeeds");
@@ -180,17 +341,15 @@ static void test_core_search_and_edge_cases(void) {
                 reloaded_i.total_postings == idx.total_postings,
                 "reloaded index metadata matches original");
 
-    /* Phrase search still works on reloaded index (positions preserved!) */
     search_execute(&reloaded_c, &reloaded_i, "\"solar energy\"", &cfg, &resp);
     ASSERT_TRUE(resp.total_matches == 1 && resp.results[0].doc_id == 1,
                 "positional phrase search works after binary reload");
     search_response_free(&resp);
 
-    /* Corrupted / missing binary file fails safely */
     ASSERT_TRUE(!persistence_load_index("_nonexistent_file.idx", &reloaded_c, &reloaded_i, NULL),
                 "missing binary index returns false safely");
 
-    /* 2j. Equivalence across Linear Scan, Linked-List, Hash-Table, and Sorted-Array */
+    /* Equivalence across Linear Scan, Linked-List, Hash-Table, and Sorted-Array */
     cfg.scoring = SCORE_BM25;
     cfg.show_snippets = false;
 
@@ -238,7 +397,7 @@ static void test_core_search_and_edge_cases(void) {
 }
 
 static void test_missing_directory(void) {
-    printf("[Test 3] Invalid/Missing Directory Handling...\n");
+    printf("[Test 5] Invalid/Missing Directory Handling...\n");
     Corpus c;
     corpus_init(&c);
     int res = corpus_load_dir(&c, "definitely_does_not_exist_dir_12345");
@@ -247,7 +406,7 @@ static void test_missing_directory(void) {
 }
 
 static void test_sample_corpus_if_present(void) {
-    printf("[Test 4] Sample Corpus (>=50 docs, >=100,000 words) & IR Eval Check...\n");
+    printf("[Test 6] Sample Corpus (>=50 docs, >=100,000 words) & Top-K Heap Parity...\n");
     Corpus c;
     InvertedIndex idx;
     corpus_init(&c);
@@ -259,12 +418,32 @@ static void test_sample_corpus_if_present(void) {
         ASSERT_TRUE(index_build(&idx, &c, true), "sample corpus indexed cleanly");
         ASSERT_TRUE(c.total_raw_tokens >= 100000, "sample corpus has at least 100,000 raw words");
 
-        SearchConfig cfg;
-        search_config_default(&cfg);
-        SearchResponse resp;
-        search_execute(&c, &idx, "\"renewable energy\"", &cfg, &resp);
-        ASSERT_TRUE(resp.total_matches > 0, "phrase search finds results in sample corpus");
-        search_response_free(&resp);
+        SearchConfig full_cfg, heap_cfg;
+        search_config_default(&full_cfg);
+        full_cfg.show_snippets = false;
+        full_cfg.top_k = 0; /* return all -> full qsort */
+        heap_cfg = full_cfg;
+        heap_cfg.top_k = 5; /* partial Top-5 -> binary min-heap */
+
+        SearchResponse r_full, r_heap;
+        search_execute(&c, &idx, "energy solar algorithm network memory", &full_cfg, &r_full);
+        search_execute(&c, &idx, "energy solar algorithm network memory", &heap_cfg, &r_heap);
+
+        bool parity = (r_full.total_matches == r_heap.total_matches && r_heap.returned_count == 5);
+        for (size_t i = 0; parity && i < 5; i++) {
+            if (r_full.results[i].doc_id != r_heap.results[i].doc_id ||
+                fabs(r_full.results[i].score - r_heap.results[i].score) > 1e-12) {
+                parity = false;
+            }
+        }
+        ASSERT_TRUE(parity, "Min-Heap Top-5 matches full qsort top 5 identically on 109k-word corpus");
+        search_response_free(&r_full);
+        search_response_free(&r_heap);
+
+        SearchResponse phrase_resp;
+        search_execute(&c, &idx, "\"renewable energy\"", &heap_cfg, &phrase_resp);
+        ASSERT_TRUE(phrase_resp.total_matches > 0, "phrase search finds results in sample corpus");
+        search_response_free(&phrase_resp);
     } else {
         printf("  (Skipping sample corpus check: data/sample_corpus not generated yet)\n");
     }
@@ -279,6 +458,8 @@ int main(void) {
     printf("=========================================================\n");
 
     test_tokenizer();
+    test_out_of_order_posting_insertion();
+    test_doubly_linked_lru_cache();
     test_core_search_and_edge_cases();
     test_missing_directory();
     test_sample_corpus_if_present();

@@ -1,0 +1,61 @@
+invalid_menu_text
+99
+5
+1
+nonexistent_folder_xyz
+1
+data/sample_corpus
+2
+5
+"renewable energy" AND solar NOT fossil
+5
+comput* AND net*
+5
+RENEWABLE---ENERGY!!! energy
+5
+"renewable energy" AND solar NOT fossil
+5
+quantumbanana_no_match
+5
+   ---   !!!
+6
+1
+1
+6
+2
+5
+5
+"renewable energy" AND solar NOT fossil
+6
+1
+2
+5
+"hash table" OR "binary search"
+11
+1
+2
+3
+3
+4
+5
+6
+2
+1
+0
+7
+0
+6
+7
+62
+10
+7
+999
+8
+3
+_cli_stress_tmp.idx
+4
+_cli_stress_tmp.idx
+5
+"geothermal heat transfer"
+10
+0

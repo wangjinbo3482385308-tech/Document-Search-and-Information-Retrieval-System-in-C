@@ -1,0 +1,86 @@
+# ==============================================================================
+# CSIR Complex Stress & Verification Batch Input
+# Exercises:
+#   - Tight LRU Cache (capacity=5) backed by Doubly Linked List + FNV-1a Hash Table
+#   - Compound Boolean + Phrase + Prefix Wildcard queries
+#   - Adversarial punctuation, repeated terms, empty/no-match queries, long queries
+#   - Multi-scoring mode isolation (BM25 / TF-IDF / Basic TF)
+#   - Stopword toggle + full index rebuild + automatic cache invalidation
+#   - Bidirectional DLL traversal (forward ->next, reverse ->prev, cursor stepping)
+#   - Mid-list arbitrary node deletion & strict invariant assertions
+#   - Binary persistence roundtrip verification (CSIR v1)
+# ==============================================================================
+
+@CACHE_CAP 5
+@SCORING bm25
+@TOPK 5
+@SNIPPETS on
+
+# --- Phase 1: Complex Multi-Feature Queries (fill LRU cache of size 5) ---
+@QUERY "renewable energy" AND solar NOT fossil
+@QUERY "operating system" AND kernel AND memory
+@QUERY "hash table" OR "binary search"
+@QUERY comput* AND net* NOT malware
+@QUERY "public transport" AND congestion NOT aviation
+@ASSERT_CACHE_INV
+
+# --- Phase 2: Cache Hit Promotion (promote oldest entry to MRU head!) ---
+@QUERY "renewable energy" AND solar NOT fossil
+@QUERY comput* AND net* NOT malware
+@HISTORY_FWD
+
+# --- Phase 3: Cache Overflow & Exact LRU Evictions ---
+# Expect 'operating system' (oldest unhit) to be evicted first!
+@QUERY "acid transaction" OR "relational database" AND storage
+@QUERY "deep space" OR telemetry AND spacecraft
+@QUERY cybersecurity AND cryptography AND authentication NOT phishing
+@ASSERT_CACHE_INV
+@HISTORY_REV
+
+# --- Phase 4: Adversarial Normalization, Edge Cases & Long Queries ---
+@QUERY RENEWABLE---ENERGY!!!   energy   SOLAR???
+@QUERY quantumbanana_nonexistent_xyz_2026
+@QUERY !!! --- ??? ... ___
+@QUERY AND OR NOT
+@QUERY "solar" AND "wind" AND "geothermal" NOT quantumbanana
+@QUERY algorithm complexity hashing pointer linked quicksort mergesort binary traversal recursion
+@ASSERT_CACHE_INV
+
+# --- Phase 5: Scoring Mode & Top-K Cache Key Isolation ---
+# Same query text under BM25 vs TF-IDF vs Basic TF must NOT cross-contaminate!
+@SCORING bm25
+@TOPK 3
+@QUERY renewable energy solar geothermal
+@SCORING tfidf
+@QUERY renewable energy solar geothermal
+@SCORING tf
+@QUERY renewable energy solar geothermal
+@SCORING bm25
+@TOPK 3
+# Re-running BM25 Top-3 should now be a CACHE HIT!
+@QUERY renewable energy solar geothermal
+@ASSERT_CACHE_INV
+
+# --- Phase 6: Bidirectional History Cursor Stepping & Arbitrary DLL Node Removal ---
+@HISTORY_FWD
+@NAV_OLDER
+@NAV_OLDER
+@NAV_NEWER
+# Remove a valid recent sequence ID and verify DLL + Hash Table stay consistent
+@REMOVE_SEQ 15
+@REMOVE_SEQ 9999
+@ASSERT_CACHE_INV
+@HISTORY_REV
+
+# --- Phase 7: Binary Persistence Save/Load Roundtrip Verification ---
+@SAVE_LOAD_VERIFY _stress_roundtrip.idx
+
+# --- Phase 8: Stopword Toggle + Index Rebuild + Stopword-Inclusive Phrase Query ---
+@STOPWORDS off
+@SCORING bm25
+@TOPK 5
+@QUERY "depend on fossil" OR "dependence on fossil fuels"
+@QUERY "reduce dependence on fossil fuels"
+@QUERY "reduce dependence on fossil fuels"
+@ASSERT_CACHE_INV
+@HISTORY_FWD

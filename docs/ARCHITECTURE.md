@@ -18,14 +18,28 @@ flowchart LR
 
 ## 2. Core Data Structures
 
-### 2.1 Primary Hash-Table Inverted Index
+### 2.1 Primary Hash-Table Inverted Index (Singly Linked Lists)
 - **Hash Function**: 64-bit FNV-1a (`offset = 14695981039346656037`, `prime = 1099511628211`).
-- **Collision Resolution**: Separate chaining via `TermEntry *next`.
+- **Collision Resolution**: Separate chaining via singly-linked `TermEntry *next`.
 - **Dynamic Rehashing**: Power-of-two bucket table doubles whenever `(unique_terms + 1) / bucket_count > 0.75`.
-- **Posting Lists**: Each `TermEntry` maintains a singly linked list of `PostingNode` structures (`postings_head`, `postings_tail`), appended in $O(1)$ because documents are ingested in monotonically increasing `doc_id` order.
-- **Positional Offsets**: Each `PostingNode` holds a dynamically grown `uint32_t *positions` array storing the 0-based raw token positions inside that document, enabling exact phrase search (`"renewable energy"`) via binary search over positions.
+- **Posting Lists**: Each `TermEntry` maintains a singly-linked list of `PostingNode` structures (`postings_head`, `postings_tail`) kept strictly sorted by ascending `doc_id` — $O(1)$ tail append in normal sequential ingestion, and sorted insertion fallback if documents arrive out of order.
+- **Positional Offsets**: Each `PostingNode` holds a sorted dynamic `uint32_t *positions` array storing 0-based raw token positions, enabling single-pass rarest-pivot exact phrase search (`"renewable energy"`).
 
-### 2.2 Alternative Index Structures (for Benchmarking)
+### 2.2 O(1) LRU Query Cache & Bidirectional History (Doubly Linked List + Hash Table)
+Implemented in `include/history_cache.h` and `src/history_cache.c`:
+- **Dual-Index `CacheNode`**: Each node participates simultaneously in:
+  1. A **Doubly Linked List** (`prev`, `next`, `head` = MRU, `tail` = LRU, plus bidirectional navigation `cursor`) for $O(1)$ promotion to head, $O(1)$ tail eviction, $O(1)$ arbitrary node unlink, and forward/reverse traversal.
+  2. A **Separate-Chaining FNV-1a Hash Table** (`hash_next`) keyed by `(scoring, top_k, snippets, stopwords, k1, b, query)` for $O(1)$ average lookup with strict configuration isolation.
+- **Why Singly Linked Lists for Postings vs Doubly Linked List for Cache/History?**
+  - Posting lists can contain millions of entries and are traversed forward-only during scoring, so omitting a `prev` pointer saves 8 bytes per posting node (64-bit).
+  - The LRU cache and search history require $O(1)$ arbitrary node detachment, $O(1)$ LRU tail eviction, and bidirectional forward/backward navigation — making a doubly linked list the optimal structure.
+
+### 2.3 Query Execution & Ranking Optimizations (`src/search.c`)
+- **Compact 24-byte `DocAccum`**: Replaces embedded string buffers with a `uint32_t matched_mask` bitmask during posting traversal, shrinking per-document accumulator memory by ~12x and building `matched_terms` strings only for the final Top-K winners.
+- **$O(M \log K)$ Binary Min-Heap Top-K Selection**: Avoids full $O(M \log M)$ sorting when `top_k < total_matches`, preserving exact deterministic `(score desc, doc_id asc)` order.
+- **Single-Pass Rarest-Pivot Phrase Matching**: Selects the phrase term with minimum `doc_freq` as the driving posting list and caches `(doc_id, ptf)` in one pass before scoring.
+
+### 2.4 Alternative Index Structures (for Benchmarking)
 1. **Linear Scan Baseline (`search_linear_scan`)**: Reads each document from disk on every query, tokenizes on the fly, and computes exact matching scores. Zero index memory, $O(T)$ query time where $T$ is total tokens in the corpus.
 2. **Linked-List Vocabulary Index (`LinkedListIndex`)**: Singly linked list of `ListTermNode` structs. Lower memory footprint (no bucket array, no positional arrays), but $O(V)$ lookup and $O(T \cdot V)$ build time.
 3. **Sorted-Array Binary Search Index (`SortedArrayIndex`)**: Lexicographically sorted array of `TermEntry *` built in $O(V \log V)$ via `qsort`, supporting $O(\log V)$ cache-friendly binary search lookups.
