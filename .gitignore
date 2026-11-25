@@ -1,0 +1,19 @@
+# Build artifacts
+*.o
+*.exe
+*.out
+bin/
+build/
+
+# Generated runtime outputs
+*.idx
+report.txt
+report.csv
+benchmark_report.csv
+
+# Editor & OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
