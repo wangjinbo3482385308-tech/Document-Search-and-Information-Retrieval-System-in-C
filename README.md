@@ -1,8 +1,28 @@
-# CSIR — Document Search & Information Retrieval System in C
+# Document Search and Information Retrieval System in C (CSIR)
+
+> **Standard C11 | Positional Inverted Index | Okapi BM25 / TF-IDF / Basic TF | Phrase, Boolean & Wildcard Search | Binary Persistence & IR Benchmarking**
 
 A modular, zero-dependency **Document Search and Information Retrieval Engine** implemented in **standard C11** (`-std=c11 -Wall -Wextra -Wpedantic`), built around a positional inverted index, deterministic relevance ranking (Basic TF, TF-IDF, Okapi BM25), persistent binary serialization, and an empirical benchmarking & IR evaluation suite.
 
 Designed to satisfy all core and optional distinction specifications of **COMP1028: Programming and Algorithms** using strictly standard C libraries — no AI/ML models, no third-party libraries, and no external retrieval frameworks.
+
+---
+
+## 中文简介
+
+本项目是一个基于 **标准 C11** 实现的高性能、零第三方依赖的**文档搜索与信息检索系统（CSIR）**，采用经典信息检索（IR）算法与底层数据结构构建，完全不使用机器学习模型、LLM 或外部检索框架。
+
+### 核心特性
+- **多格式文档加载**：支持 `.txt`、`.md` 与 TREC SGML `.trec` 格式，能够稳健处理空文件、缺失目录与异常输入。
+- **文本预处理与分词归一化**：自动小写化、标点/连字符切分、SGML 标签过滤，以及基于二分查找（`bsearch`）的英文停用词过滤。
+- **多种索引结构（含性能对照）**：
+  - **主索引**：64 位 FNV-1a 哈希表（拉链法 + 动态扩容 rehash）+ 带词位置偏移数组（`positions[]`）的链表倒排表。
+  - **对比索引**：链表词典倒排索引、排序数组二分查找索引，以及无索引线性扫描基线（Baseline）。
+- **丰富的查询语法与排序算法**：
+  - 支持单关键词/多关键词、精确短语检索（`"renewable energy"`）、布尔查询（`AND` / `OR` / `NOT`）与前缀通配符（`comput*`）。
+  - 支持 **Basic TF**、**TF-IDF** 和 **Okapi BM25** 三种确定性相关性评分，并支持结果片段高亮（Snippet）。
+- **二进制索引持久化（`CSIR v1`）**：支持将完整语料元数据、词典及位置倒排表序列化为 `.idx` 二进制文件，重载速度比从文本重建快约 **7.4 倍**。
+- **完整评测与统计报表**：内置吞吐量/延迟/内存对比基准、IR 检索质量评测（`Precision@K`、`Recall@K`、`MRR`、`MAP@10`、`NDCG@10`）、ASCII 词频柱状图，以及 `report.txt` / `report.csv` 导出功能。
 
 ---
 
