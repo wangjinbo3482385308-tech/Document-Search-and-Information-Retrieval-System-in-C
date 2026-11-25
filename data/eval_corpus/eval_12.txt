@@ -1,0 +1,2 @@
+Query Optimization and Full-Text Indexing
+Database query optimizers estimate index selectivity, while inverted indexes support BM25 and TF-IDF text ranking.

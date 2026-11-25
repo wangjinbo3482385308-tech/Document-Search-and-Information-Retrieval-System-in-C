@@ -1,0 +1,2 @@
+Hash Tables and Inverted Indexes in C
+An inverted index built on a hash table with linked posting lists enables fast constant-time term lookup in C search engines.

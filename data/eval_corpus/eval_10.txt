@@ -1,0 +1,2 @@
+DNS Resolution and Internet Routing
+BGP routing tables and hierarchical DNS servers direct Internet traffic packets reliably across autonomous networks.

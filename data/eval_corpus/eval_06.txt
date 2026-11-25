@@ -1,0 +1,2 @@
+Dynamic Memory and Pointers in C
+Proper malloc, realloc, and free usage prevents memory leaks and invalid pointer dereferences in modular C applications.

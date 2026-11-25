@@ -1,0 +1,2 @@
+Concurrency with Mutexes and Threads
+Multithreaded programs synchronize shared data structures using mutex locks and semaphores to prevent race conditions and deadlocks.

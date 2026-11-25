@@ -1,0 +1,2 @@
+Genomic Sequencing and Clinical Diagnostics
+High-throughput DNA sequencing identifies genetic variants to guide clinical diagnostics and precision medicine therapies.

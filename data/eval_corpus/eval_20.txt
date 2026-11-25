@@ -1,0 +1,2 @@
+Cryptography and Memory-Safe C Security
+Cryptographic signatures, multi-factor authentication, and bounds-checked C buffers harden software against cybersecurity vulnerabilities.

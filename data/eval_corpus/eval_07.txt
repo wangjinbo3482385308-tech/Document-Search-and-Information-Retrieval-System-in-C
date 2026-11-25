@@ -1,0 +1,2 @@
+Operating System Kernel and Virtual Memory
+The operating system kernel manages virtual memory page tables, CPU process scheduling, and hardware interrupts.

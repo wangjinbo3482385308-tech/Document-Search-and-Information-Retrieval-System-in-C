@@ -1,0 +1,13 @@
+# qid	query
+1	renewable energy solar wind
+2	geothermal renewable power
+3	inverted index hash table
+4	binary search sorting algorithms
+5	kernel virtual memory scheduling
+6	mutex threads concurrency deadlocks
+7	tcp packet congestion network
+8	acid transactions database btree
+9	mars rover space telemetry
+10	public transport traffic congestion
+11	dna sequencing clinical diagnostics
+12	cryptography cybersecurity vulnerabilities

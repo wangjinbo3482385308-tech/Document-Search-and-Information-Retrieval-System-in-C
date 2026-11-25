@@ -1,0 +1,2 @@
+Relational Databases and ACID Transactions
+Relational databases use B-tree indexes, write-ahead logging, and ACID transactions to protect data consistency and durability.
