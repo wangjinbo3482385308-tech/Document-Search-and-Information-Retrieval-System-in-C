@@ -148,19 +148,23 @@ void report_view_document(const Corpus *corpus, const InvertedIndex *idx,
     }
 
     size_t lines = 0;
+    bool truncated = false;
     const char *p = text;
     while (*p) {
         putchar(*p);
         if (*p == '\n') {
             lines++;
             if (preview_lines > 0 && lines >= preview_lines) {
-                printf("\n... [preview truncated at %zu lines] ...\n", preview_lines);
+                printf("... [preview truncated at %zu lines] ...\n", preview_lines);
+                truncated = true;
                 break;
             }
         }
         p++;
     }
-    if (lines == 0 || *(p - 1) != '\n') putchar('\n');
+    if (!truncated && p > text && *(p - 1) != '\n') {
+        putchar('\n');
+    }
     printf("=========================================================\n");
     free(text);
 }
@@ -214,10 +218,12 @@ bool report_export_txt(const char *filepath, const Corpus *corpus,
 
     if (bench && bench->hash_table.queries_run > 0) {
         fprintf(fp, "\n[3] Benchmark Comparison\n");
-        const MethodBenchResult *ms[4] = {
-            &bench->linear_scan, &bench->linked_list, &bench->hash_table, &bench->sorted_array
+        const MethodBenchResult *ms[5] = {
+            &bench->linear_scan, &bench->linked_list, &bench->hash_table,
+            &bench->sorted_array, &bench->lru_cache_hit
         };
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
+            if (ms[i]->queries_run == 0) continue;
             fprintf(fp, "  %-30s | Build=%.4fs | Avg=%.4fms | Worst=%.4fms | QPS=%.1f | Mem=%.1fKB\n",
                     ms[i]->method_name, ms[i]->build_time_sec,
                     ms[i]->avg_latency_ms, ms[i]->worst_latency_ms,
@@ -244,6 +250,23 @@ bool report_export_txt(const char *filepath, const Corpus *corpus,
     return true;
 }
 
+static void write_csv_quoted(FILE *fp, const char *s) {
+    fputc('"', fp);
+    if (s) {
+        for (const char *p = s; *p; p++) {
+            if (*p == '"') {
+                fputc('"', fp);
+                fputc('"', fp);
+            } else if (*p == '\n' || *p == '\r') {
+                fputc(' ', fp);
+            } else {
+                fputc(*p, fp);
+            }
+        }
+    }
+    fputc('"', fp);
+}
+
 bool report_export_csv(const char *filepath, const Corpus *corpus,
                        const SearchResponse *last_search,
                        const BenchmarkSummary *bench) {
@@ -256,17 +279,23 @@ bool report_export_csv(const char *filepath, const Corpus *corpus,
         for (size_t i = 0; i < last_search->returned_count; i++) {
             const SearchResult *r = &last_search->results[i];
             const Document *d = corpus_get_doc(corpus, r->doc_id);
-            fprintf(fp, "%zu,%u,\"%s\",%.6f,\"%s\"\n",
-                    i + 1, r->doc_id, d ? d->filename : "", r->score, r->matched_terms);
+            fprintf(fp, "%zu,%u,", i + 1, r->doc_id);
+            write_csv_quoted(fp, d ? d->filename : "");
+            fprintf(fp, ",%.6f,", r->score);
+            write_csv_quoted(fp, r->matched_terms);
+            fputc('\n', fp);
         }
     } else if (bench && bench->hash_table.queries_run > 0) {
         fprintf(fp, "method,build_sec,avg_latency_ms,worst_latency_ms,throughput_qps,memory_kb\n");
-        const MethodBenchResult *ms[4] = {
-            &bench->linear_scan, &bench->linked_list, &bench->hash_table, &bench->sorted_array
+        const MethodBenchResult *ms[5] = {
+            &bench->linear_scan, &bench->linked_list, &bench->hash_table,
+            &bench->sorted_array, &bench->lru_cache_hit
         };
-        for (int i = 0; i < 4; i++) {
-            fprintf(fp, "\"%s\",%.6f,%.6f,%.6f,%.2f,%.2f\n",
-                    ms[i]->method_name, ms[i]->build_time_sec,
+        for (int i = 0; i < 5; i++) {
+            if (ms[i]->queries_run == 0) continue;
+            write_csv_quoted(fp, ms[i]->method_name);
+            fprintf(fp, ",%.6f,%.6f,%.6f,%.2f,%.2f\n",
+                    ms[i]->build_time_sec,
                     ms[i]->avg_latency_ms, ms[i]->worst_latency_ms,
                     ms[i]->throughput_qps, (double)ms[i]->memory_bytes / 1024.0);
         }
@@ -274,9 +303,10 @@ bool report_export_csv(const char *filepath, const Corpus *corpus,
         fprintf(fp, "doc_id,filename,file_size,raw_tokens,indexed_tokens,unique_terms\n");
         for (size_t i = 0; i < corpus->count; i++) {
             const Document *d = &corpus->docs[i];
-            fprintf(fp, "%u,\"%s\",%zu,%u,%u,%u\n",
-                    d->doc_id, d->filename, d->file_size,
-                    d->raw_tokens, d->total_tokens, d->unique_terms);
+            fprintf(fp, "%u,", d->doc_id);
+            write_csv_quoted(fp, d->filename);
+            fprintf(fp, ",%zu,%u,%u,%u\n",
+                    d->file_size, d->raw_tokens, d->total_tokens, d->unique_terms);
         }
     }
 

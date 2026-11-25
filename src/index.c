@@ -110,6 +110,60 @@ static TermEntry *find_or_create_term(InvertedIndex *idx, const char *term) {
     return entry;
 }
 
+static void insert_position_sorted(PostingNode *p, uint32_t position) {
+    if (p->term_freq == p->pos_capacity) {
+        uint32_t new_cap = p->pos_capacity * 2;
+        uint32_t *tmp = (uint32_t *)realloc(p->positions, new_cap * sizeof(uint32_t));
+        if (!tmp) return;
+        p->positions = tmp;
+        p->pos_capacity = new_cap;
+    }
+    /* Fast path: positions arrive in ascending order */
+    if (p->term_freq == 0 || position >= p->positions[p->term_freq - 1]) {
+        p->positions[p->term_freq] = position;
+        return;
+    }
+    /* Out-of-order position: maintain sorted array for binary search */
+    uint32_t i = p->term_freq;
+    while (i > 0 && p->positions[i - 1] > position) {
+        p->positions[i] = p->positions[i - 1];
+        i--;
+    }
+    p->positions[i] = position;
+}
+
+static void link_posting_sorted(TermEntry *entry, PostingNode *node) {
+    /* Fast path: empty list or monotonically increasing doc_id */
+    if (!entry->postings_head) {
+        entry->postings_head = node;
+        entry->postings_tail = node;
+        node->next = NULL;
+        return;
+    }
+    if (node->doc_id > entry->postings_tail->doc_id) {
+        entry->postings_tail->next = node;
+        entry->postings_tail = node;
+        node->next = NULL;
+        return;
+    }
+    /* Out-of-order doc_id: insert at sorted position to preserve ascending doc_id invariant */
+    PostingNode *prev = NULL;
+    PostingNode *cur = entry->postings_head;
+    while (cur && cur->doc_id < node->doc_id) {
+        prev = cur;
+        cur = cur->next;
+    }
+    node->next = cur;
+    if (prev) {
+        prev->next = node;
+    } else {
+        entry->postings_head = node;
+    }
+    if (!cur) {
+        entry->postings_tail = node;
+    }
+}
+
 TermEntry *index_add_occurrence(InvertedIndex *idx, const char *term,
                                 uint32_t doc_id, uint32_t position) {
     if (!idx || !term || term[0] == '\0') return NULL;
@@ -120,10 +174,9 @@ TermEntry *index_add_occurrence(InvertedIndex *idx, const char *term,
      * so checking postings_tail is O(1). */
     PostingNode *p = entry->postings_tail;
     if (!p || p->doc_id != doc_id) {
-        /* Fallback scan if out-of-order insertion ever occurs */
         p = NULL;
         if (entry->postings_tail && doc_id < entry->postings_tail->doc_id) {
-            for (PostingNode *cur = entry->postings_head; cur; cur = cur->next) {
+            for (PostingNode *cur = entry->postings_head; cur && cur->doc_id <= doc_id; cur = cur->next) {
                 if (cur->doc_id == doc_id) {
                     p = cur;
                     break;
@@ -140,28 +193,15 @@ TermEntry *index_add_occurrence(InvertedIndex *idx, const char *term,
                 free(p);
                 return entry;
             }
-            if (!entry->postings_head) {
-                entry->postings_head = p;
-                entry->postings_tail = p;
-            } else {
-                entry->postings_tail->next = p;
-                entry->postings_tail = p;
-            }
+            link_posting_sorted(entry, p);
             entry->doc_freq++;
             idx->total_postings++;
         }
     }
 
-    if (p->term_freq == p->pos_capacity) {
-        uint32_t new_cap = p->pos_capacity * 2;
-        uint32_t *tmp = (uint32_t *)realloc(p->positions, new_cap * sizeof(uint32_t));
-        if (tmp) {
-            p->positions = tmp;
-            p->pos_capacity = new_cap;
-        }
-    }
-    if (p->term_freq < p->pos_capacity) {
-        p->positions[p->term_freq] = position;
+    uint32_t cap_before = p->pos_capacity;
+    insert_position_sorted(p, position);
+    if (p->term_freq < p->pos_capacity || p->pos_capacity > cap_before) {
         idx->total_positions++;
     }
     p->term_freq++;
@@ -190,13 +230,7 @@ TermEntry *index_insert_posting(InvertedIndex *idx, const char *term,
         memcpy(p->positions, positions, term_freq * sizeof(uint32_t));
     }
 
-    if (!entry->postings_head) {
-        entry->postings_head = p;
-        entry->postings_tail = p;
-    } else {
-        entry->postings_tail->next = p;
-        entry->postings_tail = p;
-    }
+    link_posting_sorted(entry, p);
 
     entry->doc_freq++;
     entry->total_freq += term_freq;

@@ -314,25 +314,30 @@ static const PostingNode *find_doc_posting(const TermEntry *entry, uint32_t doc_
     return NULL;
 }
 
-/* Count exact positional phrase occurrences in a document */
-static uint32_t count_phrase_matches_in_doc(const TermEntry **entries,
-                                            const uint32_t *offsets,
-                                            size_t phrase_len,
-                                            const PostingNode *first_posting) {
+/* Count exact positional phrase occurrences starting from the rarest word (pivot) */
+static uint32_t count_phrase_matches_from_pivot(const TermEntry **entries,
+                                                const uint32_t *offsets,
+                                                size_t phrase_len,
+                                                size_t pivot,
+                                                const PostingNode *pivot_posting) {
     const PostingNode *postings[MAX_PHRASE_WORDS];
-    postings[0] = first_posting;
-    for (size_t k = 1; k < phrase_len; k++) {
-        postings[k] = find_doc_posting(entries[k], first_posting->doc_id);
+    postings[pivot] = pivot_posting;
+    for (size_t k = 0; k < phrase_len; k++) {
+        if (k == pivot) continue;
+        postings[k] = find_doc_posting(entries[k], pivot_posting->doc_id);
         if (!postings[k]) return 0;
     }
 
+    int64_t pivot_off = (int64_t)offsets[pivot];
     uint32_t matches = 0;
-    for (uint32_t i = 0; i < first_posting->term_freq; i++) {
-        uint32_t base_pos = first_posting->positions[i];
+    for (uint32_t i = 0; i < pivot_posting->term_freq; i++) {
+        int64_t pivot_pos = (int64_t)pivot_posting->positions[i];
         bool ok = true;
-        for (size_t k = 1; k < phrase_len; k++) {
-            uint32_t expected = base_pos + offsets[k];
-            if (!has_position(postings[k]->positions, postings[k]->term_freq, expected)) {
+        for (size_t k = 0; k < phrase_len; k++) {
+            if (k == pivot) continue;
+            int64_t expected = pivot_pos + ((int64_t)offsets[k] - pivot_off);
+            if (expected < 0 ||
+                !has_position(postings[k]->positions, postings[k]->term_freq, (uint32_t)expected)) {
                 ok = false;
                 break;
             }
@@ -342,36 +347,38 @@ static uint32_t count_phrase_matches_in_doc(const TermEntry **entries,
     return matches;
 }
 
+/* Compact per-document accumulator (24 bytes instead of ~288 bytes) */
 typedef struct DocAccum {
     double   score;
+    uint32_t matched_mask;   /* bit i set if query clause i matched this document */
     uint32_t must_matched;
-    bool     excluded;
-    bool     matched_any;
-    uint32_t matched_count;
-    char     matched_terms[256];
+    uint8_t  excluded;
+    uint8_t  matched_any;
 } DocAccum;
 
-static void append_matched_term(DocAccum *acc, const char *label) {
-    if (!label || label[0] == '\0') return;
+static void append_matched_term_str(char *dst, size_t dst_size,
+                                    uint32_t *out_count, const char *label) {
+    if (!dst || !label || label[0] == '\0') return;
     /* Avoid duplicating same label in display string */
-    if (acc->matched_terms[0] != '\0') {
-        const char *found = strstr(acc->matched_terms, label);
+    if (dst[0] != '\0') {
+        const char *found = strstr(dst, label);
         if (found) {
-            bool left_ok = (found == acc->matched_terms) || (*(found - 1) == ' ' && *(found - 2) == ',');
+            bool left_ok = (found == dst) ||
+                           ((size_t)(found - dst) >= 2 && *(found - 1) == ' ' && *(found - 2) == ',');
             char after = found[strlen(label)];
             bool right_ok = (after == '\0' || after == ',');
             if (left_ok && right_ok) return;
         }
     }
-    size_t cur_len = strlen(acc->matched_terms);
+    size_t cur_len = strlen(dst);
     size_t add_len = strlen(label) + (cur_len > 0 ? 2 : 0);
-    if (cur_len + add_len + 1 < sizeof(acc->matched_terms)) {
+    if (cur_len + add_len + 1 < dst_size) {
         if (cur_len > 0) {
-            strcat(acc->matched_terms, ", ");
+            strcat(dst, ", ");
         }
-        strcat(acc->matched_terms, label);
+        strcat(dst, label);
     }
-    acc->matched_count++;
+    if (out_count) (*out_count)++;
 }
 
 static int cmp_search_result(const void *a, const void *b) {
@@ -384,6 +391,48 @@ static int cmp_search_result(const void *a, const void *b) {
     if (ra->doc_id < rb->doc_id) return -1;
     if (ra->doc_id > rb->doc_id) return 1;
     return 0;
+}
+
+/* Min-heap comparator: returns true if candidate a is strictly WORSE than b
+ * (so the root of the min-heap is always the weakest Top-K candidate). */
+static bool result_is_worse(const SearchResult *a, const SearchResult *b) {
+    return cmp_search_result(a, b) > 0;
+}
+
+static void minheap_sift_up(SearchResult *heap, size_t idx) {
+    while (idx > 0) {
+        size_t parent = (idx - 1) / 2;
+        if (result_is_worse(&heap[idx], &heap[parent])) {
+            SearchResult tmp = heap[idx];
+            heap[idx] = heap[parent];
+            heap[parent] = tmp;
+            idx = parent;
+        } else {
+            break;
+        }
+    }
+}
+
+static void minheap_sift_down(SearchResult *heap, size_t size, size_t idx) {
+    while (true) {
+        size_t left = idx * 2 + 1;
+        size_t right = left + 1;
+        size_t worst = idx;
+        if (left < size && result_is_worse(&heap[left], &heap[worst])) {
+            worst = left;
+        }
+        if (right < size && result_is_worse(&heap[right], &heap[worst])) {
+            worst = right;
+        }
+        if (worst != idx) {
+            SearchResult tmp = heap[idx];
+            heap[idx] = heap[worst];
+            heap[worst] = tmp;
+            idx = worst;
+        } else {
+            break;
+        }
+    }
 }
 
 static bool term_matches_pattern(const char *word, const char *pattern) {
@@ -535,10 +584,52 @@ static void collect_snippet_terms(const ParsedQuery *pq, char storage[][MAX_TERM
     *out_n = n;
 }
 
-static bool finalize_results(const Corpus *corpus, const ParsedQuery *pq,
-                             const DocAccum *accum, uint32_t must_total,
-                             const SearchConfig *cfg, double t0,
-                             SearchResponse *out_resp) {
+static void populate_result_matched_terms(SearchResult *res, uint32_t mask,
+                                          const ParsedQuery *pq, const InvertedIndex *idx) {
+    res->matched_terms[0] = '\0';
+    res->matched_term_count = 0;
+
+    for (size_t i = 0; i < pq->count && i < 32; i++) {
+        if ((mask & (1U << i)) == 0) continue;
+        const QueryClause *c = &pq->clauses[i];
+        if (c->kind == CLAUSE_TERM) {
+            append_matched_term_str(res->matched_terms, sizeof(res->matched_terms),
+                                    &res->matched_term_count, c->term);
+        } else if (c->kind == CLAUSE_PHRASE) {
+            char phrase_label[128];
+            size_t lpos = (size_t)snprintf(phrase_label, sizeof(phrase_label), "\"");
+            for (size_t w = 0; w < c->phrase_len; w++) {
+                lpos += (size_t)snprintf(phrase_label + lpos, sizeof(phrase_label) - lpos,
+                                         "%s%s", w > 0 ? " " : "", c->phrase_words[w]);
+            }
+            snprintf(phrase_label + lpos, sizeof(phrase_label) - lpos, "\"");
+            append_matched_term_str(res->matched_terms, sizeof(res->matched_terms),
+                                    &res->matched_term_count, phrase_label);
+        } else if (c->kind == CLAUSE_WILDCARD) {
+            if (idx) {
+                const TermEntry **matches = NULL;
+                size_t mcount = index_lookup_prefix(idx, c->term, &matches);
+                for (size_t m = 0; m < mcount; m++) {
+                    if (find_doc_posting(matches[m], res->doc_id)) {
+                        append_matched_term_str(res->matched_terms, sizeof(res->matched_terms),
+                                                &res->matched_term_count, matches[m]->term);
+                    }
+                }
+                free(matches);
+            } else {
+                char wild_label[MAX_TERM_LEN + 2];
+                snprintf(wild_label, sizeof(wild_label), "%s*", c->term);
+                append_matched_term_str(res->matched_terms, sizeof(res->matched_terms),
+                                        &res->matched_term_count, wild_label);
+            }
+        }
+    }
+}
+
+static bool finalize_results(const Corpus *corpus, const InvertedIndex *idx,
+                             const ParsedQuery *pq, const DocAccum *accum,
+                             uint32_t must_total, const SearchConfig *cfg,
+                             double t0, SearchResponse *out_resp) {
     size_t match_count = 0;
     for (size_t d = 0; d < corpus->count; d++) {
         if (accum[d].excluded) continue;
@@ -558,28 +649,58 @@ static bool finalize_results(const Corpus *corpus, const ParsedQuery *pq,
         return true;
     }
 
-    SearchResult *all = (SearchResult *)calloc(match_count, sizeof(SearchResult));
-    if (!all) return false;
+    size_t top_k = (cfg->top_k == 0 || cfg->top_k > match_count) ? match_count : cfg->top_k;
+    SearchResult *top = (SearchResult *)calloc(top_k, sizeof(SearchResult));
+    if (!top) return false;
 
-    size_t k = 0;
-    for (size_t d = 0; d < corpus->count; d++) {
-        if (accum[d].excluded) continue;
-        if (must_total > 0) {
-            if (accum[d].must_matched < must_total) continue;
-        } else {
-            if (!accum[d].matched_any) continue;
+    if (top_k < match_count) {
+        /* O(M log K) Top-K selection using a binary min-heap */
+        size_t heap_size = 0;
+        for (size_t d = 0; d < corpus->count; d++) {
+            if (accum[d].excluded) continue;
+            if (must_total > 0) {
+                if (accum[d].must_matched < must_total) continue;
+            } else {
+                if (!accum[d].matched_any) continue;
+            }
+            SearchResult cand;
+            memset(&cand, 0, sizeof(cand));
+            cand.doc_id = (uint32_t)d;
+            cand.score = accum[d].score;
+
+            if (heap_size < top_k) {
+                top[heap_size] = cand;
+                minheap_sift_up(top, heap_size);
+                heap_size++;
+            } else if (result_is_worse(&top[0], &cand)) {
+                top[0] = cand;
+                minheap_sift_down(top, top_k, 0);
+            }
         }
-        all[k].doc_id = (uint32_t)d;
-        all[k].score = accum[d].score;
-        all[k].matched_term_count = accum[d].matched_count;
-        snprintf(all[k].matched_terms, sizeof(all[k].matched_terms), "%s", accum[d].matched_terms);
-        k++;
+    } else {
+        size_t k = 0;
+        for (size_t d = 0; d < corpus->count; d++) {
+            if (accum[d].excluded) continue;
+            if (must_total > 0) {
+                if (accum[d].must_matched < must_total) continue;
+            } else {
+                if (!accum[d].matched_any) continue;
+            }
+            top[k].doc_id = (uint32_t)d;
+            top[k].score = accum[d].score;
+            k++;
+        }
     }
 
-    qsort(all, match_count, sizeof(SearchResult), cmp_search_result);
+    /* Sort only the final Top-K results in O(K log K) */
+    qsort(top, top_k, sizeof(SearchResult), cmp_search_result);
 
-    size_t top_k = (cfg->top_k == 0 || cfg->top_k > match_count) ? match_count : cfg->top_k;
-    out_resp->results = all;
+    /* Populate matched_terms only for the final Top-K winners */
+    for (size_t i = 0; i < top_k; i++) {
+        populate_result_matched_terms(&top[i], accum[top[i].doc_id].matched_mask, pq, idx);
+    }
+
+    out_resp->results = top;
     out_resp->returned_count = top_k;
     out_resp->query_time_sec = csir_now_sec() - t0;
 
@@ -590,15 +711,42 @@ static bool finalize_results(const Corpus *corpus, const ParsedQuery *pq,
         collect_snippet_terms(pq, snip_storage, snip_terms, &snip_n, 32);
         if (snip_n > 0) {
             for (size_t i = 0; i < top_k; i++) {
-                const Document *doc = corpus_get_doc(corpus, all[i].doc_id);
+                const Document *doc = corpus_get_doc(corpus, top[i].doc_id);
                 search_extract_snippet(doc, snip_terms, snip_n,
-                                       all[i].snippet, sizeof(all[i].snippet));
+                                       top[i].snippet, sizeof(top[i].snippet));
             }
         }
     }
 
     return true;
 }
+
+/* Shared helper: accumulate scores for a posting list (eliminates duplication across index types) */
+static void accumulate_posting_list(const Corpus *corpus, const PostingNode *head,
+                                    uint32_t doc_freq, ClauseOp op, size_t clause_idx,
+                                    const SearchConfig *cfg, DocAccum *accum) {
+    uint32_t bit = clause_idx < 32 ? (1U << clause_idx) : 0U;
+    for (const PostingNode *p = head; p; p = p->next) {
+        if (p->doc_id >= corpus->count) continue;
+        DocAccum *acc = &accum[p->doc_id];
+        if (op == OP_MUST_NOT) {
+            acc->excluded = 1;
+            continue;
+        }
+        double s = compute_term_score(cfg->scoring, p->term_freq, doc_freq,
+                                      corpus->count, corpus->docs[p->doc_id].total_tokens,
+                                      corpus->avg_doc_len, cfg->bm25_k1, cfg->bm25_b);
+        acc->score += s;
+        acc->matched_any = 1;
+        acc->matched_mask |= bit;
+        if (op == OP_MUST) acc->must_matched++;
+    }
+}
+
+typedef struct PhraseHit {
+    uint32_t doc_id;
+    uint32_t ptf;
+} PhraseHit;
 
 bool search_execute(const Corpus *corpus, const InvertedIndex *idx,
                     const char *query, const SearchConfig *cfg,
@@ -632,34 +780,20 @@ bool search_execute(const Corpus *corpus, const InvertedIndex *idx,
 
     for (size_t i = 0; i < pq.count; i++) {
         const QueryClause *c = &pq.clauses[i];
+        uint32_t bit = i < 32 ? (1U << i) : 0U;
         if (c->op == OP_MUST) must_total++;
 
         if (c->kind == CLAUSE_TERM) {
             const TermEntry *e = index_lookup(idx, c->term);
             if (!e) continue;
-
-            for (const PostingNode *p = e->postings_head; p; p = p->next) {
-                if (p->doc_id >= corpus->count) continue;
-                DocAccum *acc = &accum[p->doc_id];
-                if (c->op == OP_MUST_NOT) {
-                    acc->excluded = true;
-                    continue;
-                }
-                double s = compute_term_score(cfg->scoring, p->term_freq, e->doc_freq,
-                                              corpus->count, corpus->docs[p->doc_id].total_tokens,
-                                              corpus->avg_doc_len, cfg->bm25_k1, cfg->bm25_b);
-                acc->score += s;
-                acc->matched_any = true;
-                if (c->op == OP_MUST) acc->must_matched++;
-                append_matched_term(acc, e->term);
-            }
+            accumulate_posting_list(corpus, e->postings_head, e->doc_freq, c->op, i, cfg, accum);
         } else if (c->kind == CLAUSE_WILDCARD) {
             const TermEntry **matches = NULL;
             size_t mcount = index_lookup_prefix(idx, c->term, &matches);
             if (mcount == 0) continue;
 
             /* Track per-doc hit so OP_MUST increments at most once for this wildcard clause */
-            bool *doc_hit = (bool *)calloc(corpus->count, sizeof(bool));
+            uint8_t *doc_hit = (uint8_t *)calloc(corpus->count, sizeof(uint8_t));
             if (!doc_hit) {
                 free(matches);
                 free(accum);
@@ -672,19 +806,19 @@ bool search_execute(const Corpus *corpus, const InvertedIndex *idx,
                     if (p->doc_id >= corpus->count) continue;
                     DocAccum *acc = &accum[p->doc_id];
                     if (c->op == OP_MUST_NOT) {
-                        acc->excluded = true;
+                        acc->excluded = 1;
                         continue;
                     }
                     double s = compute_term_score(cfg->scoring, p->term_freq, e->doc_freq,
                                                   corpus->count, corpus->docs[p->doc_id].total_tokens,
                                                   corpus->avg_doc_len, cfg->bm25_k1, cfg->bm25_b);
                     acc->score += s;
-                    acc->matched_any = true;
+                    acc->matched_any = 1;
+                    acc->matched_mask |= bit;
                     if (c->op == OP_MUST && !doc_hit[p->doc_id]) {
                         acc->must_matched++;
-                        doc_hit[p->doc_id] = true;
+                        doc_hit[p->doc_id] = 1;
                     }
-                    append_matched_term(acc, e->term);
                 }
             }
             free(doc_hit);
@@ -692,55 +826,60 @@ bool search_execute(const Corpus *corpus, const InvertedIndex *idx,
         } else if (c->kind == CLAUSE_PHRASE) {
             const TermEntry *entries[MAX_PHRASE_WORDS];
             bool all_found = true;
+            size_t pivot = 0;
             for (size_t w = 0; w < c->phrase_len; w++) {
                 entries[w] = index_lookup(idx, c->phrase_words[w]);
                 if (!entries[w]) {
                     all_found = false;
                     break;
                 }
+                if (entries[w]->doc_freq < entries[pivot]->doc_freq) {
+                    pivot = w; /* Drive intersection from rarest term */
+                }
             }
             if (!all_found) continue;
 
-            /* Count phrase document frequency first for deterministic IDF */
-            uint32_t phrase_df = 0;
-            for (const PostingNode *p = entries[0]->postings_head; p; p = p->next) {
-                if (count_phrase_matches_in_doc(entries, c->phrase_offsets, c->phrase_len, p) > 0) {
-                    phrase_df++;
+            /* Single-pass phrase matching: collect (doc_id, ptf) once, then score */
+            size_t max_hits = entries[pivot]->doc_freq;
+            PhraseHit *hits = (PhraseHit *)malloc(max_hits * sizeof(PhraseHit));
+            if (!hits) {
+                free(accum);
+                return false;
+            }
+
+            size_t hit_count = 0;
+            for (const PostingNode *p = entries[pivot]->postings_head; p; p = p->next) {
+                if (p->doc_id >= corpus->count) continue;
+                uint32_t ptf = count_phrase_matches_from_pivot(entries, c->phrase_offsets,
+                                                               c->phrase_len, pivot, p);
+                if (ptf > 0 && hit_count < max_hits) {
+                    hits[hit_count].doc_id = p->doc_id;
+                    hits[hit_count].ptf = ptf;
+                    hit_count++;
                 }
             }
-            if (phrase_df == 0) continue;
 
-            char phrase_label[128];
-            size_t lpos = (size_t)snprintf(phrase_label, sizeof(phrase_label), "\"");
-            for (size_t w = 0; w < c->phrase_len; w++) {
-                lpos += (size_t)snprintf(phrase_label + lpos, sizeof(phrase_label) - lpos,
-                                         "%s%s", w > 0 ? " " : "", c->phrase_words[w]);
-            }
-            snprintf(phrase_label + lpos, sizeof(phrase_label) - lpos, "\"");
-
-            for (const PostingNode *p = entries[0]->postings_head; p; p = p->next) {
-                if (p->doc_id >= corpus->count) continue;
-                uint32_t ptf = count_phrase_matches_in_doc(entries, c->phrase_offsets, c->phrase_len, p);
-                if (ptf == 0) continue;
-
-                DocAccum *acc = &accum[p->doc_id];
+            uint32_t phrase_df = (uint32_t)hit_count;
+            for (size_t h = 0; h < hit_count; h++) {
+                uint32_t did = hits[h].doc_id;
+                DocAccum *acc = &accum[did];
                 if (c->op == OP_MUST_NOT) {
-                    acc->excluded = true;
+                    acc->excluded = 1;
                     continue;
                 }
-                double s = compute_term_score(cfg->scoring, ptf, phrase_df,
-                                              corpus->count, corpus->docs[p->doc_id].total_tokens,
+                double s = compute_term_score(cfg->scoring, hits[h].ptf, phrase_df,
+                                              corpus->count, corpus->docs[did].total_tokens,
                                               corpus->avg_doc_len, cfg->bm25_k1, cfg->bm25_b);
-                /* Phrase bonus (1.5x) rewards exact phrase proximity */
-                acc->score += (cfg->scoring == SCORE_BASIC_TF) ? (double)ptf : (s * 1.5);
-                acc->matched_any = true;
+                acc->score += (cfg->scoring == SCORE_BASIC_TF) ? (double)hits[h].ptf : (s * 1.5);
+                acc->matched_any = 1;
+                acc->matched_mask |= bit;
                 if (c->op == OP_MUST) acc->must_matched++;
-                append_matched_term(acc, phrase_label);
             }
+            free(hits);
         }
     }
 
-    bool ok = finalize_results(corpus, &pq, accum, must_total, cfg, t0, out_resp);
+    bool ok = finalize_results(corpus, idx, &pq, accum, must_total, cfg, t0, out_resp);
     free(accum);
     return ok;
 }
@@ -783,7 +922,6 @@ bool search_linear_scan(const Corpus *corpus, const char *query,
         return true;
     }
 
-    /* Two-pass linear scan: pass 1 reads every document from disk to count tf[d][q] and df[q] */
     uint32_t *doc_term_tf = (uint32_t *)calloc(corpus->count * pq.count, sizeof(uint32_t));
     uint32_t *df = (uint32_t *)calloc(pq.count, sizeof(uint32_t));
     DocAccum *accum = (DocAccum *)calloc(corpus->count, sizeof(DocAccum));
@@ -817,22 +955,22 @@ bool search_linear_scan(const Corpus *corpus, const char *query,
             uint32_t tf = doc_term_tf[d * pq.count + i];
             if (tf == 0) continue;
             if (pq.clauses[i].op == OP_MUST_NOT) {
-                accum[d].excluded = true;
+                accum[d].excluded = 1;
                 continue;
             }
             double s = compute_term_score(cfg->scoring, tf, df[i], corpus->count,
                                           corpus->docs[d].total_tokens,
                                           corpus->avg_doc_len, cfg->bm25_k1, cfg->bm25_b);
             accum[d].score += s;
-            accum[d].matched_any = true;
+            accum[d].matched_any = 1;
+            accum[d].matched_mask |= (i < 32 ? (1U << i) : 0U);
             if (pq.clauses[i].op == OP_MUST) accum[d].must_matched++;
-            append_matched_term(&accum[d], pq.clauses[i].term);
         }
     }
 
     SearchConfig no_snip = *cfg;
     no_snip.show_snippets = false;
-    bool ok = finalize_results(corpus, &pq, accum, must_total, &no_snip, t0, out_resp);
+    bool ok = finalize_results(corpus, NULL, &pq, accum, must_total, &no_snip, t0, out_resp);
     free(doc_term_tf);
     free(df);
     free(accum);
@@ -866,25 +1004,12 @@ bool search_linked_list(const Corpus *corpus, const LinkedListIndex *ll,
 
         const ListTermNode *e = ll_index_lookup(ll, c->term);
         if (!e) continue;
-        for (const PostingNode *p = e->postings_head; p; p = p->next) {
-            if (p->doc_id >= corpus->count) continue;
-            if (c->op == OP_MUST_NOT) {
-                accum[p->doc_id].excluded = true;
-                continue;
-            }
-            double s = compute_term_score(cfg->scoring, p->term_freq, e->doc_freq,
-                                          corpus->count, corpus->docs[p->doc_id].total_tokens,
-                                          corpus->avg_doc_len, cfg->bm25_k1, cfg->bm25_b);
-            accum[p->doc_id].score += s;
-            accum[p->doc_id].matched_any = true;
-            if (c->op == OP_MUST) accum[p->doc_id].must_matched++;
-            append_matched_term(&accum[p->doc_id], e->term);
-        }
+        accumulate_posting_list(corpus, e->postings_head, e->doc_freq, c->op, i, cfg, accum);
     }
 
     SearchConfig no_snip = *cfg;
     no_snip.show_snippets = false;
-    bool ok = finalize_results(corpus, &pq, accum, must_total, &no_snip, t0, out_resp);
+    bool ok = finalize_results(corpus, NULL, &pq, accum, must_total, &no_snip, t0, out_resp);
     free(accum);
     return ok;
 }
@@ -916,25 +1041,12 @@ bool search_sorted_array(const Corpus *corpus, const SortedArrayIndex *sa,
 
         const TermEntry *e = sa_index_lookup(sa, c->term);
         if (!e) continue;
-        for (const PostingNode *p = e->postings_head; p; p = p->next) {
-            if (p->doc_id >= corpus->count) continue;
-            if (c->op == OP_MUST_NOT) {
-                accum[p->doc_id].excluded = true;
-                continue;
-            }
-            double s = compute_term_score(cfg->scoring, p->term_freq, e->doc_freq,
-                                          corpus->count, corpus->docs[p->doc_id].total_tokens,
-                                          corpus->avg_doc_len, cfg->bm25_k1, cfg->bm25_b);
-            accum[p->doc_id].score += s;
-            accum[p->doc_id].matched_any = true;
-            if (c->op == OP_MUST) accum[p->doc_id].must_matched++;
-            append_matched_term(&accum[p->doc_id], e->term);
-        }
+        accumulate_posting_list(corpus, e->postings_head, e->doc_freq, c->op, i, cfg, accum);
     }
 
     SearchConfig no_snip = *cfg;
     no_snip.show_snippets = false;
-    bool ok = finalize_results(corpus, &pq, accum, must_total, &no_snip, t0, out_resp);
+    bool ok = finalize_results(corpus, NULL, &pq, accum, must_total, &no_snip, t0, out_resp);
     free(accum);
     return ok;
 }
