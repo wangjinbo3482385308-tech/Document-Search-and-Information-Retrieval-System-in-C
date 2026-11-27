@@ -30,6 +30,7 @@ static int cmp_stopword(const void *key, const void *elem) {
     return strcmp(k, e);
 }
 
+/* 使用标准库 bsearch 在有序停用词表上进行 O(log S) 二分查找 */
 bool tokenizer_is_stopword(const char *term) {
     if (!term || term[0] == '\0') return false;
     return bsearch(term, ENGLISH_STOPWORDS, STOPWORD_COUNT,

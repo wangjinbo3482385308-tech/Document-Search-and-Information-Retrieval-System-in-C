@@ -92,45 +92,50 @@ void qcache_free(QueryCache *cache) {
     memset(cache, 0, sizeof(*cache));
 }
 
-/* ==================== Doubly Linked List Primitives (O(1)) ==================== */
+/* ==================== 双向链表核心操作（均为 O(1)） ==================== */
 
+/* 从双向链表中摘除任意节点：同步维护 head、tail 与历史浏览游标 cursor */
 static void dll_unlink(QueryCache *cache, CacheNode *node) {
     if (cache->cursor == node) {
+        /* 若被删节点正好是当前游标，优先切向更旧节点，否则切向更新节点 */
         cache->cursor = node->next ? node->next : node->prev;
     }
     if (node->prev) {
         node->prev->next = node->next;
     } else {
-        cache->head = node->next;
+        cache->head = node->next; /* 被摘除的是表头 (MRU) */
     }
     if (node->next) {
         node->next->prev = node->prev;
     } else {
-        cache->tail = node->prev;
+        cache->tail = node->prev; /* 被摘除的是表尾 (LRU) */
     }
     node->prev = NULL;
     node->next = NULL;
 }
 
+/* 头插到双向链表表头，使其成为最新使用 (MRU) 节点 */
 static void dll_push_front(QueryCache *cache, CacheNode *node) {
     node->prev = NULL;
     node->next = cache->head;
     if (cache->head) {
         cache->head->prev = node;
     } else {
-        cache->tail = node;
+        cache->tail = node; /* 原本为空链表 */
     }
     cache->head = node;
 }
 
+/* 命中缓存或更新节点时，以 O(1) 提升到双向链表表头 (MRU) */
 static void dll_move_to_front(QueryCache *cache, CacheNode *node) {
     if (cache->head == node) return;
     dll_unlink(cache, node);
     dll_push_front(cache, node);
 }
 
-/* ==================== Hash Table Primitives (O(1) avg) ==================== */
+/* ==================== 哈希表拉链桶操作（均摊 O(1)） ==================== */
 
+/* 通过复合键在哈希桶单向冲突链中查找对应的 CacheNode */
 static CacheNode *hash_find(const QueryCache *cache, const char *key, size_t *out_bucket) {
     size_t b = (size_t)(fnv1a_key_hash(key) & (cache->bucket_count - 1));
     if (out_bucket) *out_bucket = b;

@@ -4,12 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 64-bit FNV-1a hash function for strings */
+/* 64-bit FNV-1a 哈希函数：分布均匀、计算开销低，适合短字符串词项 */
 static uint64_t fnv1a_hash(const char *str) {
-    uint64_t hash = 14695981039346656037ULL;
+    uint64_t hash = 14695981039346656037ULL; /* FNV offset basis */
     for (const unsigned char *p = (const unsigned char *)str; *p; p++) {
         hash ^= (uint64_t)(*p);
-        hash *= 1099511628211ULL;
+        hash *= 1099511628211ULL;            /* FNV prime */
     }
     return hash;
 }
@@ -56,6 +56,8 @@ void index_free(InvertedIndex *idx) {
     memset(idx, 0, sizeof(*idx));
 }
 
+/* 动态扩容（Rehash）：当负载因子超过 0.75 时将桶数翻倍（保持 2 的幂），
+ * 利用位运算 (hash & mask) 替代取模，将全部词项重新散列到新桶中。 */
 static bool index_rehash(InvertedIndex *idx, size_t new_bucket_count) {
     TermEntry **new_buckets = (TermEntry **)calloc(new_bucket_count, sizeof(TermEntry *));
     if (!new_buckets) return false;
@@ -66,7 +68,7 @@ static bool index_rehash(InvertedIndex *idx, size_t new_bucket_count) {
         while (entry) {
             TermEntry *next = entry->next;
             size_t b = (size_t)(fnv1a_hash(entry->term) & mask);
-            entry->next = new_buckets[b];
+            entry->next = new_buckets[b]; /* 头插法移入新桶单向链表 */
             new_buckets[b] = entry;
             entry = next;
         }
@@ -110,20 +112,22 @@ static TermEntry *find_or_create_term(InvertedIndex *idx, const char *term) {
     return entry;
 }
 
+/* 将词位置插入动态数组并保持升序（顺序写入 O(1)，乱序写入做插入移位），
+ * 以便短语检索时对 positions[] 直接执行 O(log tf) 二分查找。 */
 static void insert_position_sorted(PostingNode *p, uint32_t position) {
     if (p->term_freq == p->pos_capacity) {
-        uint32_t new_cap = p->pos_capacity * 2;
+        uint32_t new_cap = p->pos_capacity * 2; /* 倍增扩容，均摊 O(1) */
         uint32_t *tmp = (uint32_t *)realloc(p->positions, new_cap * sizeof(uint32_t));
         if (!tmp) return;
         p->positions = tmp;
         p->pos_capacity = new_cap;
     }
-    /* Fast path: positions arrive in ascending order */
+    /* 快路径：绝大多数场景下位置单调递增 */
     if (p->term_freq == 0 || position >= p->positions[p->term_freq - 1]) {
         p->positions[p->term_freq] = position;
         return;
     }
-    /* Out-of-order position: maintain sorted array for binary search */
+    /* 乱序回退：右移较大元素以维持升序不变量 */
     uint32_t i = p->term_freq;
     while (i > 0 && p->positions[i - 1] > position) {
         p->positions[i] = p->positions[i - 1];
@@ -132,6 +136,8 @@ static void insert_position_sorted(PostingNode *p, uint32_t position) {
     p->positions[i] = position;
 }
 
+/* 将倒排节点按 doc_id 升序链入单向链表：
+ * 正常按序建索引时走 O(1) 尾插快路径；乱序插入时定位有序位置防止破坏升序不变量。 */
 static void link_posting_sorted(TermEntry *entry, PostingNode *node) {
     /* Fast path: empty list or monotonically increasing doc_id */
     if (!entry->postings_head) {

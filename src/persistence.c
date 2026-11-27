@@ -43,6 +43,8 @@ static bool read_str_into(FILE *fp, char *buf, size_t buf_size) {
     return true;
 }
 
+/* 将语料元数据与完整位置倒排索引序列化为 CSIR v1 二进制文件：
+ * 布局 = [Header] + [Document Table] + [Vocabulary & Positional Posting Lists] */
 bool persistence_save_index(const char *filepath, const Corpus *corpus,
                             const InvertedIndex *idx, double *out_elapsed_sec) {
     if (!filepath || !corpus || !idx) return false;
@@ -104,6 +106,9 @@ bool persistence_save_index(const char *filepath, const Corpus *corpus,
     return ok;
 }
 
+/* 从 CSIR v1 二进制文件反序列化恢复语料与索引：
+ * 先读入临时对象并逐项校验魔数/版本/字节数，全部成功后再原子替换当前内存状态，
+ * 确保损坏或截断的索引文件不会破坏现有内存数据。 */
 bool persistence_load_index(const char *filepath, Corpus *corpus,
                             InvertedIndex *idx, double *out_elapsed_sec) {
     if (!filepath || !corpus || !idx) return false;

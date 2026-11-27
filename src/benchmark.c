@@ -226,6 +226,11 @@ static int cmp_int_desc(const void *a, const void *b) {
     return (*(const int *)b) - (*(const int *)a);
 }
 
+/* 信息检索质量评测：基于查询集与分级相关性标注 (qrels) 计算经典 IR 指标
+ *   - Precision@K / Recall@K：前 K 条结果的准确率与召回率
+ *   - MRR (Mean Reciprocal Rank)：首个相关文档排名倒数的均值
+ *   - MAP@10 (Mean Average Precision)：前 10 位平均准确率
+ *   - NDCG@10 (Normalized Discounted Cumulative Gain)：支持分级相关度 (0/1/2) 的排序质量 */
 bool benchmark_run_ir_eval(const Corpus *corpus, const InvertedIndex *idx,
                            const char *queries_path, const char *qrels_path,
                            ScoringMethod method, IREvalMetrics *out_metrics) {

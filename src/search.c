@@ -64,6 +64,11 @@ void search_response_free(SearchResponse *resp) {
     memset(resp, 0, sizeof(*resp));
 }
 
+/* 确定性相关性打分函数：支持三种经典 IR 公式
+ *   1. Basic TF:   score = tf
+ *   2. TF-IDF:     score = (1 + ln(tf)) * (ln((N + 1) / (df + 1)) + 1)
+ *   3. Okapi BM25: score = idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / avgdl))
+ */
 static double compute_term_score(ScoringMethod method, uint32_t tf, uint32_t df,
                                  size_t num_docs, uint32_t doc_len, double avg_doc_len,
                                  double k1, double b) {
@@ -314,7 +319,9 @@ static const PostingNode *find_doc_posting(const TermEntry *entry, uint32_t doc_
     return NULL;
 }
 
-/* Count exact positional phrase occurrences starting from the rarest word (pivot) */
+/* 最短词驱动的精确短语位置匹配：
+ * 以短语中 doc_freq 最小的词（pivot）为锚点，检查其余词在对应相对偏移位置
+ * (pivot_pos + (offsets[k] - offsets[pivot])) 是否全部存在（二分查找）。 */
 static uint32_t count_phrase_matches_from_pivot(const TermEntry **entries,
                                                 const uint32_t *offsets,
                                                 size_t phrase_len,
@@ -347,13 +354,14 @@ static uint32_t count_phrase_matches_from_pivot(const TermEntry **entries,
     return matches;
 }
 
-/* Compact per-document accumulator (24 bytes instead of ~288 bytes) */
+/* 紧凑型每文档累加器（仅 24 字节，相比内嵌字符串缩小 ~12 倍）：
+ * 遍历倒排表热点循环中只做 O(1) 位掩码标记，仅对最终 Top-K 结果拼接 matched_terms。 */
 typedef struct DocAccum {
     double   score;
-    uint32_t matched_mask;   /* bit i set if query clause i matched this document */
-    uint32_t must_matched;
-    uint8_t  excluded;
-    uint8_t  matched_any;
+    uint32_t matched_mask;   /* 第 i 位置 1 表示命中了第 i 个查询子句 */
+    uint32_t must_matched;   /* 已命中的 AND (OP_MUST) 必选子句数量 */
+    uint8_t  excluded;       /* 命中 NOT (OP_MUST_NOT) 时置 1 排除该文档 */
+    uint8_t  matched_any;    /* 是否至少命中了一个正向子句 */
 } DocAccum;
 
 static void append_matched_term_str(char *dst, size_t dst_size,
@@ -393,8 +401,9 @@ static int cmp_search_result(const void *a, const void *b) {
     return 0;
 }
 
-/* Min-heap comparator: returns true if candidate a is strictly WORSE than b
- * (so the root of the min-heap is always the weakest Top-K candidate). */
+/* 二叉最小堆比较器：当候选 a 严格劣于 b 时返回 true。
+ * 堆顶 heap[0] 始终保存当前 Top-K 中最弱的候选，新候选更优时替换堆顶并下沉，
+ * 从而在 O(M log K) 时间内完成 Top-K 筛选（避免对全部 M 篇文档做 O(M log M) 全排）。 */
 static bool result_is_worse(const SearchResult *a, const SearchResult *b) {
     return cmp_search_result(a, b) > 0;
 }
